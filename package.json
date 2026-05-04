@@ -6,6 +6,7 @@
   "main": "agent.ts",
   "scripts": {
     "start": "tsx agent.ts",
+    "dev": "tsx scripts/dev.ts",
     "typecheck": "tsc --noEmit"
   },
   "engines": {

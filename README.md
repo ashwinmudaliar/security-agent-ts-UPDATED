@@ -42,7 +42,11 @@ npx tsx agent.ts test-app/
 
 The report writes to `security-report.md`. The audit trail writes to `investigation-log.json`.
 
-For the webhook server (per-PR review), see [`webhook-server/README.md`](webhook-server/README.md) — it covers `GITHUB_TOKEN`, `GITHUB_WEBHOOK_SECRET`, smee.io setup, and a sample-payload curl recipe.
+For the webhook server (per-PR review), see [`webhook-server/README.md`](webhook-server/README.md) — it covers `GITHUB_TOKEN`, `GITHUB_WEBHOOK_SECRET`, smee.io setup, and a sample-payload curl recipe. After one-time setup, day-to-day use is a single command:
+
+```bash
+npm run dev   # boots webhook server + smee tunnel in one terminal
+```
 
 ## Example Output
 
