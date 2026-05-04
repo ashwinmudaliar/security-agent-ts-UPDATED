@@ -1,14 +1,14 @@
-# Security Investigation Agent (TypeScript)
+# Security Investigation Agent (TypeScript) — Updated
 
-A multi-agent security auditor built on the [Claude Agent SDK](https://platform.claude.com/docs/en/agent-sdk/overview). Point it at a codebase, get back a security report with vulnerability chains, evidence, and remediation steps.
+A multi-agent security auditor built on the [Claude Agent SDK](https://platform.claude.com/docs/en/agent-sdk/overview). Point it at a codebase or a GitHub PR, get back a report with vulnerability chains, CVE-confirmed dependency findings, evidence, and concrete suggested fixes.
 
-This is the TypeScript sibling of the [Python implementation](https://github.com/ashwinmudaliar/claude-agent-sdk-security-investigator). Same architecture — orchestrator + two parallel subagents + safety hooks — different host language. Pick whichever fits your stack.
+Upgraded sibling of the [original take-home (v1)](https://github.com/ashwinmudaliar/claude-agent-sdk-security-investigator-TS), itself a TypeScript port of the [Python implementation](https://github.com/ashwinmudaliar/claude-agent-sdk-security-investigator). v1 mirrors the Python sibling's architecture (orchestrator + two parallel subagents + hooks); this version extends it — see [What's new](#whats-new-in-this-version) below.
 
-SDK features used: multi-agent orchestration, subagent delegation, extended thinking, hooks, in-process MCP servers, and Markdown skills.
+SDK features used: multi-agent orchestration, subagent delegation (two parallel auditors + one serial remediation subagent), extended thinking, hooks, in-process MCP servers, and Markdown skills.
 
 ## What's New In This Version
 
-This is the upgraded sibling of [security-agent-ts](https://github.com/ashwinmudaliar/security-agent-ts) (the original take-home). Four additions, each leveraging a different Agent SDK primitive:
+Four additions on top of v1, each leveraging a different Agent SDK primitive:
 
 | | SDK primitive | What it adds | Where |
 |---|---|---|---|
@@ -24,8 +24,8 @@ The CLI (`upgraded/agent.ts <repo>`) is for ad-hoc audits. The webhook server (`
 ## Quick Start
 
 ```bash
-git clone https://github.com/ashwinmudaliar/security-agent-ts-UPDATED.git
-cd security-agent-ts-UPDATED
+git clone https://github.com/ashwinmudaliar/claude-agent-sdk-security-investigator-TS-UPDATED.git
+cd claude-agent-sdk-security-investigator-TS-UPDATED
 npm install
 cp .env.example .env   # add ANTHROPIC_API_KEY (required for both modes)
 
