@@ -1,0 +1,147 @@
+# Security Investigation Agent (TypeScript)
+
+A multi-agent security auditor built on the [Claude Agent SDK](https://platform.claude.com/docs/en/agent-sdk/overview). Point it at a codebase, get back a security report with vulnerability chains, evidence, and remediation steps.
+
+This is the TypeScript sibling of the [Python implementation](https://github.com/ashwinmudaliar/claude-agent-sdk-security-investigator). Same architecture — orchestrator + two parallel subagents + safety hooks — different host language. Pick whichever fits your stack.
+
+SDK features used: multi-agent orchestration, subagent delegation, extended thinking, and hooks.
+
+## Quick Start
+
+```bash
+git clone https://github.com/ashwinmudaliar/claude-agent-sdk-security-investigator-TS.git
+cd claude-agent-sdk-security-investigator-TS
+npm install
+cp .env.example .env   # add your Anthropic API key
+npx tsx agent.ts test-app/
+```
+
+The report writes to `security-report.md`. The audit trail writes to `investigation-log.json`.
+
+## Example Output
+
+The `example-output/` directory contains a complete run against the included test app (a deliberately vulnerable Flask application — yes, Python: the agent's host language and the target's language are independent).
+
+The agent found 6 Critical, 5 High, 2 Medium, and 1 Low findings, plus three vulnerability chains. Here's one:
+
+> **Chain B — Full Credential Harvest Without a Login**
+>
+> 1. `GET /admin/users` → returns all usernames, IDs, and roles (no auth required)
+> 2. `GET /search?q=x%' UNION SELECT password_hash,role FROM users WHERE '1'='1` → dumps all MD5 hashes
+> 3. `hashcat -m 0 hashes.txt rockyou.txt` → cracks all hashes in seconds given MD5's speed and the lack of salting
+>
+> Result: plaintext passwords for every account, with no authentication ever attempted.
+
+The missing auth on `/admin/*`, the SQL injection on `/search`, and the weak hashing are three separate findings. The agent connected them into one attack path.
+
+[Full report →](example-output/security-report.md) · [Investigation log →](example-output/investigation-log.json)
+
+## How It Works
+
+The investigation follows a four-phase workflow:
+
+**Reconnaissance.** The orchestrator (Sonnet) maps the repo: languages, frameworks, entry points, dependency manifests.
+
+**Parallel investigation.** Two subagents (Haiku), each with a focused mandate and a constrained tool set:
+
+```typescript
+const SUBAGENTS: Record<string, AgentDefinition> = {
+  "code-analysis": {
+    description: "Reads source code to find logic-level vulnerabilities...",
+    prompt: `You are a senior application security engineer auditing source code.
+Your mandate is logic-level vulnerabilities in the application code itself —
+NOT dependencies and NOT configuration. The other subagent owns those.
+...`,
+    tools: ["Read", "Grep", "Glob"],
+    model: "haiku",
+  },
+  "deps-and-config": {
+    description: "Reads dependency manifests, lockfiles, and configuration files...",
+    prompt: `You are a senior application security engineer auditing the
+non-code surface of a project — dependencies, config, secrets.
+...`,
+    tools: ["Read", "Grep", "Glob", "Bash"],
+    model: "haiku",
+  },
+};
+```
+
+Each entry is an object with a description, prompt, tools, and model. Code-analysis gets read-only tools. Deps-and-config gets Bash too, for running `pip audit` and `npm audit`.
+
+**Synthesis.** The orchestrator uses extended thinking (10,000 token budget) to deduplicate findings across subagents, filter for exploitability, and identify vulnerability chains. Extended thinking is what turns "SQL injection + missing admin auth + MD5 hashing" into "full credential harvest without a login."
+
+**Report.** A structured Markdown document with findings grouped by severity, each with location, evidence, exploitability analysis, and remediation. Written to disk and printed to stdout.
+
+### Hooks
+
+Two hooks enforce execution safety and auditability:
+
+```typescript
+hooks: {
+  PreToolUse: [
+    { matcher: "Bash", hooks: [makePreToolHook(target)] },
+  ],
+  PostToolUse: [
+    {
+      matcher: "Read|Grep|Glob|Bash",
+      hooks: [makePostToolHook(auditLog)],
+    },
+  ],
+},
+```
+
+The **PreToolUse hook** intercepts every Bash command before execution. Known interpreters and runtimes (`python`, `node`, `flask run`, etc.) are blocked when their arguments point into the target repo. Inspection and audit commands (`pip audit`, `grep`, `ls`, `git log`) are explicitly allowed.
+
+The **PostToolUse hook** writes an audit trail. Every Read, Grep, Glob, and Bash call is logged with timestamp, agent type, input, and a human-readable summary. The investigation log lets you verify the report against what the agent actually read.
+
+## Architecture
+
+```
+                 ┌─────────────────────────┐
+                 │  Orchestrator (Sonnet)   │
+                 │  Extended thinking: 10k  │
+                 └────────┬────────────────┘
+                          │
+              ┌───────────┴───────────┐
+              ▼                       ▼
+   ┌──────────────────┐   ┌──────────────────┐
+   │  code-analysis   │   │  deps-and-config  │
+   │  (Haiku)         │   │  (Haiku)          │
+   │  Read,Grep,Glob  │   │  Read,Grep,Glob,  │
+   │                  │   │  Bash             │
+   └──────────────────┘   └───────────────────┘
+```
+
+Sonnet handles cross-domain reasoning: recon, delegation briefs, deduplication, vulnerability chain analysis. Haiku does the thorough file-by-file work: reading source, grepping for patterns, running audit tools.
+
+**Model choices.** Both models are set as `ORCHESTRATOR_MODEL` and `SUBAGENT_MODEL` constants at the top of `agent.ts`. The defaults — Sonnet 4.6 + Haiku 4.5 — are tuned for a fast, cheap demo on small-to-medium repos. Swap the orchestrator to Opus 4.7 when synthesis gets harder (large codebases, more findings to deduplicate, deeper chain reasoning). Drop both to Haiku for the leanest run. Per-subagent overrides also work — set `model:` on a specific `AgentDefinition` if one investigation needs a different tier than the others.
+
+## Limitations
+
+The agent reads code but doesn't execute it — the PreToolUse hook blocks any attempt to run interpreters against the target repo. The tradeoff: runtime-only vulnerabilities (race conditions, timing attacks, environment-specific behavior) won't show up. If you need those, pair this with a DAST scanner.
+
+Context window size bounds the repos this can handle. The test app is 3 files. On a real codebase, the orchestrator's recon phase matters more because the subagents can't read everything. Larger repos need a file-prioritization step before delegation.
+
+## Adapt This Pattern
+
+The architecture generalizes to any problem where independent experts investigate and an orchestrator reasons across their findings:
+
+- **Compliance audit.** Swap the prompts to check against SOC 2 controls or HIPAA requirements. The tool set stays the same.
+- **Code review.** Split into correctness vs. maintainability. The orchestrator is where you weigh "this is technically wrong" against "this is technically fine but no one will be able to maintain it."
+- **Due diligence.** Point it at an acquisition target's repo. The report structure already maps to what a technical reviewer needs before a deal closes.
+
+The subagent definitions are data at the top of `agent.ts`. Change the prompts, adjust the tools, add a third subagent if the domain calls for it.
+
+## Where This Could Go
+
+- **DAST subagent.** Spin up the target in a container, make HTTP requests, confirm the static findings at runtime.
+- **Git history analysis.** `git log` and `git blame` can surface recently-changed security-critical code, reverted fixes, and secrets that were committed then removed. That's a natural third subagent.
+- **CI integration.** Run it on every PR. The Markdown output already works as a GitHub comment, and the investigation log gives reviewers a record of what was checked.
+- **Multi-repo scanning.** The orchestrator prompt doesn't assume a single repo. Wrap it in a loop.
+- **Organization-specific rules.** Banned functions, required headers, internal API patterns. Feed them into the subagent prompts via a config file.
+
+## References
+
+- [Claude Agent SDK documentation](https://platform.claude.com/docs/en/agent-sdk/overview)
+- [Building effective agents](https://www.anthropic.com/engineering/building-effective-agents)
+- [Python sibling implementation](https://github.com/ashwinmudaliar/claude-agent-sdk-security-investigator)

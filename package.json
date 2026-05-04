@@ -1,0 +1,25 @@
+{
+  "name": "claude-agent-sdk-security-investigator-ts",
+  "version": "1.0.0",
+  "description": "A multi-agent security auditor built on the Claude Agent SDK (TypeScript). Point it at a codebase, get back a security report with vulnerability chains, evidence, and remediation steps.",
+  "type": "module",
+  "main": "agent.ts",
+  "scripts": {
+    "start": "tsx agent.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.126",
+    "@hono/node-server": "^2.0.1",
+    "dotenv": "^16.4.0",
+    "hono": "^4.12.16"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.4.0"
+  }
+}
