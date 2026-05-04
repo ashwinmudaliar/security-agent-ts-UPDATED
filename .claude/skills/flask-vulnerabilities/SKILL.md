@@ -1,3 +1,8 @@
+---
+name: flask-vulnerabilities
+description: Flask/Werkzeug-specific vulnerability patterns the code-analysis subagent should check for in addition to its general data-flow / auth / crypto mandate. Six concrete patterns — Blueprint routes missing @login_required, hardcoded SECRET_KEY, Markup/escape misuse, missing CSRF on state-changing routes, debug mode enabled in production, and unvalidated redirects via the `?next=` query parameter — each with grep recipes, vulnerable/safe code examples, and severity guidance.
+---
+
 # Flask vulnerability patterns
 
 Flask/Werkzeug-specific pitfalls to check for in addition to the general

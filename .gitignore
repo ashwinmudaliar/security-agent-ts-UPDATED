@@ -1,5 +1,9 @@
 .env
-.claude/
+# Ignore Claude Code's local state under .claude/ but keep the skills bundles
+# tracked — those are project source, loaded by the SDK's `skills` primitive.
+.claude/*
+!.claude/skills
+!.claude/skills/**
 node_modules/
 .DS_Store
 *.log

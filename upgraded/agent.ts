@@ -17,17 +17,10 @@
  * this agent (compliance audit, code review, due diligence), edit those.
  */
 
-import { readFileSync } from "node:fs";
 import { writeFile, stat } from "node:fs/promises";
-import {
-  resolve as resolvePath,
-  basename,
-  dirname,
-  join as joinPath,
-} from "node:path";
+import { resolve as resolvePath, basename } from "node:path";
 import { performance } from "node:perf_hooks";
 import process from "node:process";
-import { fileURLToPath } from "node:url";
 
 import {
   createSdkMcpServer,
@@ -54,42 +47,6 @@ const SUBAGENT_MODEL: AgentDefinition["model"] = "haiku"; // Haiku 4.5
 const REPORT_PATH = "security-report.md";
 const AUDIT_LOG_PATH = "investigation-log.json";
 
-// ----------------------------------------------------------------------------
-// Skill loader. Skills live in upgraded/skills/<name>/SKILL.md. Each skill is
-// a markdown document with stack-specific patterns we prepend to a subagent's
-// prompt so it knows what to grep for in addition to its general mandate.
-// ----------------------------------------------------------------------------
-
-const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
-const SKILLS_DIR = joinPath(SCRIPT_DIR, "skills");
-
-function loadSkill(name: string): string | null {
-  const path = joinPath(SKILLS_DIR, name, "SKILL.md");
-  try {
-    return readFileSync(path, "utf-8").trim();
-  } catch (err) {
-    process.stderr.write(
-      `warning: skill "${name}" not loaded from ${path}: ` +
-        `${(err as Error).message}\n`,
-    );
-    return null;
-  }
-}
-
-/**
- * Prepend a skill's content to a subagent prompt under a fixed heading. Returns
- * the original prompt unchanged if the skill failed to load.
- */
-function withSkill(basePrompt: string, skill: string | null): string {
-  if (!skill) return basePrompt;
-  return (
-    `Stack-specific patterns to also check for:\n\n${skill}\n\n` +
-    `---\n\n${basePrompt}`
-  );
-}
-
-const FLASK_VULNERABILITIES_SKILL = loadSkill("flask-vulnerabilities");
-
 const SUBAGENTS: Record<string, AgentDefinition> = {
   "code-analysis": {
     description:
@@ -97,8 +54,7 @@ const SUBAGENTS: Record<string, AgentDefinition> = {
       "from user input to dangerous sinks, missing auth, dangerous " +
       "function usage, weak crypto, error handling that leaks PII or " +
       "stack traces.",
-    prompt: withSkill(
-      `You are a senior application security engineer auditing source code.
+    prompt: `You are a senior application security engineer auditing source code.
 
 Your mandate is logic-level vulnerabilities in the application code itself —
 NOT dependencies and NOT configuration. The other subagent owns those.
@@ -151,9 +107,8 @@ Final output format:
     }
 
 Output ONLY the JSON. No prose around it.`,
-      FLASK_VULNERABILITIES_SKILL,
-    ),
     tools: ["Read", "Grep", "Glob"],
+    skills: ["flask-vulnerabilities"],
     model: SUBAGENT_MODEL,
   },
   "deps-and-config": {
@@ -861,6 +816,10 @@ async function runInvestigation(targetArg: string): Promise<number> {
     permissionMode: "bypassPermissions",
     allowDangerouslySkipPermissions: true,
     persistSession: false,
+    // Load project-level settings so the SDK discovers skills under
+    // `.claude/skills/` (the `code-analysis` subagent declares it via
+    // `skills: ['flask-vulnerabilities']`).
+    settingSources: ["project"],
     additionalDirectories: [target],
     maxThinkingTokens: 10000,
     hooks: {
