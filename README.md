@@ -4,19 +4,38 @@ A multi-agent security auditor built on the [Claude Agent SDK](https://platform.
 
 This is the TypeScript sibling of the [Python implementation](https://github.com/ashwinmudaliar/claude-agent-sdk-security-investigator). Same architecture — orchestrator + two parallel subagents + safety hooks — different host language. Pick whichever fits your stack.
 
-SDK features used: multi-agent orchestration, subagent delegation, extended thinking, and hooks.
+SDK features used: multi-agent orchestration, subagent delegation, extended thinking, hooks, in-process MCP servers, and Markdown skills.
+
+## What's New In This Version
+
+This is the upgraded sibling of [security-agent-ts](https://github.com/ashwinmudaliar/security-agent-ts) (the original take-home). Four additions, each leveraging a different Agent SDK primitive:
+
+| | SDK primitive | What it adds | Where |
+|---|---|---|---|
+| **1** | Subagent definition | A third subagent — `remediation` — drafts a diff-style patch for every finding the two auditor subagents produce | [`upgraded/agent.ts`](upgraded/agent.ts) — `remediation` block |
+| **2** | In-process MCP server (`createSdkMcpServer` + `tool`) | GitHub Advisory CVE/GHSA lookups for the deps-and-config subagent — real version-range and fixed-version data lands in findings | [`upgraded/agent.ts`](upgraded/agent.ts) — `githubMcpServer` |
+| **3** | Skill (Markdown knowledge plugin) | Six Flask-specific vulnerability patterns prepended to the code-analysis subagent's prompt — concrete grep recipes and severity guidance | [`upgraded/skills/flask-vulnerabilities/SKILL.md`](upgraded/skills/flask-vulnerabilities/SKILL.md) |
+| **4** | Subprocess wrapper + new `INVESTIGATION_SCOPE` env contract | Hono webhook server — the agent as a GitHub PR-review service. Per-PR audits scoped to changed files, posted as PR comments | [`webhook-server/`](webhook-server/) |
+
+**How they compose:** the orchestrator runs recon, then kicks off `code-analysis` (skill loaded) and `deps-and-config` (MCP enabled) in parallel, merges their findings, hands the merged list to `remediation` for fixes, and synthesizes everything with extended thinking. The synthesis chain reasoning crosses sources — a skill-flagged hardcoded `SECRET_KEY` plus an MCP-confirmed Werkzeug CVE end up in the same vulnerability chain in the report, even though they came from separate subagents.
+
+The CLI (`upgraded/agent.ts <repo>`) is for ad-hoc audits. The webhook server (`webhook-server/server.ts`) wraps the same agent for GitHub PR review — webhook in, scoped audit, comment out.
 
 ## Quick Start
 
 ```bash
-git clone https://github.com/ashwinmudaliar/claude-agent-sdk-security-investigator-TS.git
-cd claude-agent-sdk-security-investigator-TS
+git clone https://github.com/ashwinmudaliar/security-agent-ts-UPDATED.git
+cd security-agent-ts-UPDATED
 npm install
-cp .env.example .env   # add your Anthropic API key
-npx tsx agent.ts test-app/
+cp .env.example .env   # add ANTHROPIC_API_KEY (required for both modes)
+
+# CLI mode — one-off audit of a local directory
+npx tsx upgraded/agent.ts test-app/
 ```
 
 The report writes to `security-report.md`. The audit trail writes to `investigation-log.json`.
+
+For the webhook server (per-PR review), see [`webhook-server/README.md`](webhook-server/README.md) — it covers `GITHUB_TOKEN`, `GITHUB_WEBHOOK_SECRET`, smee.io setup, and a sample-payload curl recipe.
 
 ## Example Output
 
