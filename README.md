@@ -4,20 +4,27 @@ A multi-agent security auditor built on the [Claude Agent SDK](https://platform.
 
 Upgraded sibling of the [original take-home (v1)](https://github.com/ashwinmudaliar/claude-agent-sdk-security-investigator-TS), itself a TypeScript port of the [Python implementation](https://github.com/ashwinmudaliar/claude-agent-sdk-security-investigator). v1 mirrors the Python sibling's architecture (orchestrator + two parallel subagents + hooks); this version extends it — see [What's new](#whats-new-in-this-version) below.
 
-SDK features used: multi-agent orchestration, subagent delegation (two parallel auditors + one serial remediation subagent), extended thinking, hooks, in-process MCP servers, and Markdown skills.
+SDK features used: multi-agent orchestration, subagent delegation (two parallel auditors + one serial remediation subagent), extended thinking, hooks, and in-process MCP servers.
 
 ## What's New In This Version
 
-Four additions on top of v1, each leveraging a different Agent SDK primitive:
+Four additions on top of v1 — two leveraging Agent SDK primitives directly, two integration patterns built around the SDK.
 
-| | SDK primitive | What it adds | Where |
+### SDK primitives leveraged
+
+| | Primitive (SDK API) | What it adds | Where |
 |---|---|---|---|
-| **1** | Subagent definition | A third subagent — `remediation` — drafts a diff-style patch for every finding the two auditor subagents produce | [`upgraded/agent.ts`](upgraded/agent.ts) — `remediation` block |
-| **2** | In-process MCP server (`createSdkMcpServer` + `tool`) | GitHub Advisory CVE/GHSA lookups for the deps-and-config subagent — real version-range and fixed-version data lands in findings | [`upgraded/agent.ts`](upgraded/agent.ts) — `githubMcpServer` |
-| **3** | Skill (Markdown knowledge plugin) | Six Flask-specific vulnerability patterns prepended to the code-analysis subagent's prompt — concrete grep recipes and severity guidance | [`upgraded/skills/flask-vulnerabilities/SKILL.md`](upgraded/skills/flask-vulnerabilities/SKILL.md) |
-| **4** | Subprocess wrapper + new `INVESTIGATION_SCOPE` env contract | Hono webhook server — the agent as a GitHub PR-review service. Per-PR audits scoped to changed files, posted as PR comments | [`webhook-server/`](webhook-server/) |
+| **1** | `AgentDefinition` + `agents` field on `Options` | Third subagent — `remediation` — drafts a diff-style patch for every finding the two auditor subagents produce | [`upgraded/agent.ts`](upgraded/agent.ts) — `remediation` block |
+| **2** | `createSdkMcpServer` + `tool` | In-process MCP server giving the deps-and-config subagent GitHub Advisory lookups — real CVE/GHSA IDs, CVSS, and fixed-version data lands in findings | [`upgraded/agent.ts`](upgraded/agent.ts) — `githubMcpServer` |
 
-**How they compose:** the orchestrator runs recon, then kicks off `code-analysis` (skill loaded) and `deps-and-config` (MCP enabled) in parallel, merges their findings, hands the merged list to `remediation` for fixes, and synthesizes everything with extended thinking. The synthesis chain reasoning crosses sources — a skill-flagged hardcoded `SECRET_KEY` plus an MCP-confirmed Werkzeug CVE end up in the same vulnerability chain in the report, even though they came from separate subagents.
+### Integration patterns built on top
+
+| | Pattern | What it adds | Where |
+|---|---|---|---|
+| **3** | Skills file convention with a custom loader | Six Flask-specific vulnerability patterns prepended to the code-analysis subagent's prompt. Uses Anthropic's Skills `SKILL.md` file convention; the loader is ~10 lines of `readFileSync` (the SDK npm library doesn't expose a skill-loading API — skills live in Claude Code's harness, so we wired our own) | [`upgraded/skills/flask-vulnerabilities/SKILL.md`](upgraded/skills/flask-vulnerabilities/SKILL.md), `loadSkill()` in [`upgraded/agent.ts`](upgraded/agent.ts) |
+| **4** | Subprocess wrapper as a webhook target | Hono webhook server exposes the agent as a GitHub PR-review service. `child_process.spawn` invokes the CLI per webhook; a custom `INVESTIGATION_SCOPE` env-var contract scopes each audit to the PR's changed files | [`webhook-server/`](webhook-server/) |
+
+**How they compose at runtime:** the orchestrator runs recon, then kicks off `code-analysis` (skill prepended to its prompt) and `deps-and-config` (MCP server attached) in parallel, merges their findings, hands the merged list to `remediation` for fixes, and synthesizes with extended thinking. The chain reasoning crosses sources — a skill-flagged hardcoded `SECRET_KEY` plus an MCP-confirmed Werkzeug CVE end up in the same vulnerability chain even though they came from separate subagents.
 
 The CLI (`upgraded/agent.ts <repo>`) is for ad-hoc audits. The webhook server (`webhook-server/server.ts`) wraps the same agent for GitHub PR review — webhook in, scoped audit, comment out.
 
