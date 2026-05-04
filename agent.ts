@@ -6,10 +6,12 @@
  *     npx tsx agent.ts /path/to/repo
  *
  * The orchestrator (Sonnet 4.6) does reconnaissance, delegates to two focused
- * subagents (Haiku 4.5) — one for code, one for config/dependencies — and
- * synthesizes their findings with extended thinking. Two hooks: a PreToolUse
- * guardrail that blocks code execution from the target repo, and a PostToolUse
- * hook that writes an audit trail of every Read/Grep/Glob/Bash call.
+ * subagents (Haiku 4.5) — one for code, one for config/dependencies — collects
+ * their findings, then hands the merged set to a third subagent (remediation,
+ * Haiku 4.5) which drafts fixes. The orchestrator synthesizes everything with
+ * extended thinking. Two hooks: a PreToolUse guardrail that blocks code
+ * execution from the target repo, and a PostToolUse hook that writes an audit
+ * trail of every Read/Grep/Glob/Bash call.
  *
  * Subagent definitions and prompts live at the top of this file. To repurpose
  * this agent (compliance audit, code review, due diligence), edit those.
@@ -21,7 +23,9 @@ import { performance } from "node:perf_hooks";
 import process from "node:process";
 
 import {
+  createSdkMcpServer,
   query,
+  tool,
   type AgentDefinition,
   type Options,
   type PreToolUseHookInput,
@@ -29,6 +33,7 @@ import {
   type HookCallback,
   type HookJSONOutput,
 } from "@anthropic-ai/claude-agent-sdk";
+import { z } from "zod";
 
 import "dotenv/config";
 
@@ -78,6 +83,7 @@ first (route definitions, main files), then follow data flows.
 Return findings as a JSON array. Each finding MUST have these fields:
 
     {
+      "id":            "CA-1", "CA-2", ... (unique within this subagent),
       "title":         "Short imperative description",
       "severity":      "CRITICAL" | "HIGH" | "MEDIUM" | "LOW",
       "category":      "injection" | "auth" | "crypto" | "deserialization" |
@@ -102,6 +108,7 @@ Final output format:
 
 Output ONLY the JSON. No prose around it.`,
     tools: ["Read", "Grep", "Glob"],
+    skills: ["flask-vulnerabilities"],
     model: SUBAGENT_MODEL,
   },
   "deps-and-config": {
@@ -118,6 +125,20 @@ Your mandate (the code-analysis subagent owns application logic):
 1. Dependency manifests: requirements.txt, package.json, Cargo.toml, go.mod,
    Gemfile, pom.xml, build.gradle. Flag pinned versions known to be
    vulnerable. Flag unpinned ranges that pull in vulnerable transitive deps.
+
+   For EVERY dependency you suspect is vulnerable, confirm against GitHub's
+   security advisory database using the GitHub MCP tools:
+     • \`mcp__github__list_global_security_advisories\` — search by ecosystem
+       (\`pip\`, \`npm\`, \`maven\`, \`rubygems\`, \`go\`, \`rust\`, etc.) and
+       package name to enumerate published advisories.
+     • \`mcp__github__get_global_security_advisory\` — fetch the full record
+       (CVE ID, GHSA ID, CVSS score, affected ranges, patched versions) for
+       a specific GHSA ID.
+   When a finding is backed by a confirmed advisory, include in its
+   \`description\` and \`evidence\` fields: the CVE ID (e.g. CVE-2023-12345),
+   the GHSA ID, the CVSS severity, the affected version range, and the
+   first fixed version. Put the upgrade target into \`remediation\`. If no
+   advisory matches, say so explicitly so the orchestrator can downgrade.
 2. Hardcoded secrets: API keys, tokens, private keys, DB passwords, JWT
    secrets in .env files, config files, source files (yes, source — secrets
    are config-shaped wherever they live).
@@ -129,16 +150,18 @@ Your mandate (the code-analysis subagent owns application logic):
    --json\`, etc. Use Bash for these. If they aren't installed, note that
    and skip rather than failing.
 
-Use Read, Grep, Glob, and Bash. NEVER execute application code itself
-(don't run \`python app.py\`, \`node index.js\`, etc.) — only run audit tools
-and inspection commands. The PreToolUse hook will block execution attempts
-anyway, but don't try.
+Use Read, Grep, Glob, Bash, and the GitHub advisory MCP tools
+(\`mcp__github__list_global_security_advisories\`,
+\`mcp__github__get_global_security_advisory\`). NEVER execute application code
+itself (don't run \`python app.py\`, \`node index.js\`, etc.) — only run audit
+tools and inspection commands. The PreToolUse hook will block execution
+attempts anyway, but don't try.
 
 Return findings as a JSON array using the same schema as the code-analysis
-subagent:
+subagent (use \`id\` prefix "DC-" — DC-1, DC-2, ...):
 
     {
-      "title", "severity", "category", "location",
+      "id", "title", "severity", "category", "location",
       "description", "evidence", "exploitability", "remediation"
     }
 
@@ -154,7 +177,82 @@ Final output:
     }
 
 Output ONLY the JSON. No prose around it.`,
-    tools: ["Read", "Grep", "Glob", "Bash"],
+    tools: [
+      "Read",
+      "Grep",
+      "Glob",
+      "Bash",
+      "mcp__github__list_global_security_advisories",
+      "mcp__github__get_global_security_advisory",
+    ],
+    model: SUBAGENT_MODEL,
+  },
+  remediation: {
+    description:
+      "Receives the merged findings from code-analysis and deps-and-config " +
+      "and drafts a concrete suggested fix for each one. Read-only — never " +
+      "modifies files in the target repo. Output is text (code snippet, " +
+      "config change, or process change) that lands in the final report.",
+    prompt: `You are a senior application security engineer drafting fixes
+for a set of findings produced by two upstream auditors (code-analysis and
+deps-and-config). Your job is REMEDIATION ONLY — you do not re-audit, do not
+add new findings, and do not modify any files. Fixes are text the report
+will display under each finding.
+
+You will receive a JSON payload that contains the merged findings list:
+
+    {
+      "findings": [
+        { "id", "title", "severity", "category", "location",
+          "description", "evidence", "exploitability", "remediation" },
+        ...
+      ]
+    }
+
+The upstream \`remediation\` field is a one-liner. Your job is to upgrade it
+into a concrete, actionable fix a developer can apply in an afternoon.
+
+For each finding:
+
+1. Use Read, Grep, and Glob to gather just enough context — the function
+   around the vulnerable line, the framework idioms in use, the existing
+   code style. Do not re-derive the vulnerability; trust the finding.
+2. Draft a "suggested_fix" with two parts:
+   a. \`summary\` — one or two sentences describing the change.
+   b. \`patch\` — the concrete change. Prefer a unified-diff-style snippet
+      (\`- old\` / \`+ new\`) when the fix is code. For config or process
+      changes, use the closest equivalent (\`# before\` / \`# after\`,
+      or a short numbered procedure).
+3. Match the codebase: same language, same framework conventions, same
+   style. If a parameterized-query helper already exists, use it. If the
+   project uses a specific crypto library, use that one.
+4. If a finding genuinely cannot be fixed without a larger refactor, say
+   so explicitly in \`summary\` and outline the smallest safe step.
+
+DO NOT:
+  - Modify any files. You have Read/Grep/Glob only — use them.
+  - Invent APIs. If you're unsure a function exists, grep for it.
+  - Re-rank severities or merge findings — the orchestrator owns that.
+  - Output prose around the JSON.
+
+Return EXACTLY this JSON shape:
+
+    {
+      "fixes": [
+        {
+          "id":             "CA-1" | "DC-3" | ...  (must match an input id),
+          "summary":        "One or two sentences.",
+          "patch":          "Multi-line string. Diff-style preferred.",
+          "confidence":     "high" | "medium" | "low",
+          "notes":          "Optional caveats — empty string if none."
+        },
+        ...
+      ]
+    }
+
+Every finding in the input MUST have a corresponding entry in \`fixes\`,
+keyed by \`id\`. Output ONLY the JSON.`,
+    tools: ["Read", "Grep", "Glob"],
     model: SUBAGENT_MODEL,
   },
 };
@@ -164,10 +262,11 @@ investigator orchestrating an audit of an unfamiliar codebase. Your job is to
 produce a reasoned, prioritized security report — not a flat list of pattern
 matches.
 
-You have two subagents available via the Task tool:
+You have three subagents available via the Task tool:
 
   • code-analysis    — reads application source for logic vulns
   • deps-and-config  — reads manifests, configs, env files; runs audit tools
+  • remediation      — drafts a concrete fix for each finding (read-only)
 
 WORKFLOW (follow in order):
 
@@ -178,16 +277,31 @@ WORKFLOW (follow in order):
    - Overall size and structure
    Keep this light — you're orienting, not auditing yet.
 
-2. DELEGATE. Launch BOTH subagents in parallel using the Task tool. Give
-   each one a brief that summarizes what you found in recon: language(s),
-   framework, key files to focus on. Do not duplicate their work.
+2. DELEGATE (audit). Launch BOTH \`code-analysis\` and \`deps-and-config\`
+   in parallel using the Task tool. Give each one a brief that summarizes
+   what you found in recon: language(s), framework, key files to focus on.
+   Do not duplicate their work.
 
-3. SYNTHESIZE. After both return their JSON findings, reason carefully
-   (extended thinking is enabled — use it):
+3. MERGE FINDINGS. When both return their JSON, merge their findings into
+   a single list. Preserve every \`id\` (CA-* and DC-*) — the remediation
+   subagent will reference them. Do not deduplicate yet; that happens in
+   synthesis after fixes are in hand.
 
-   a. DEDUPLICATION. The two subagents may flag the same root cause from
-      different angles (e.g. a hardcoded secret that's also a weak-crypto
-      issue). Merge.
+4. DELEGATE (remediation). Launch the \`remediation\` subagent with a single
+   message containing the merged findings list as JSON:
+
+       { "findings": [ ...all findings from steps above... ] }
+
+   Wait for it to return its \`fixes\` array. Each fix is keyed by the
+   finding \`id\`.
+
+5. SYNTHESIZE. With findings AND fixes in hand, reason carefully (extended
+   thinking is enabled — use it):
+
+   a. DEDUPLICATION. The two audit subagents may flag the same root cause
+      from different angles (e.g. a hardcoded secret that's also a weak-
+      crypto issue). Merge — keep the higher severity, combine evidence,
+      and pick the more thorough suggested fix from the matched ids.
 
    b. EXPLOITABILITY FILTER. For each finding, ask: is this actually
       reachable by an attacker given the input path? Downgrade or drop
@@ -202,7 +316,7 @@ WORKFLOW (follow in order):
    d. PRIORITIZED REMEDIATION. Order findings by severity, then by
       remediation cost (cheap wins first within a tier).
 
-4. WRITE THE REPORT. Produce a single Markdown document in EXACTLY this
+6. WRITE THE REPORT. Produce a single Markdown document in EXACTLY this
    structure (no extra top-level sections, no preamble):
 
 \`\`\`
@@ -210,7 +324,7 @@ WORKFLOW (follow in order):
 
 **Target:** {target path}
 **Date:** {YYYY-MM-DD}
-**Agent:** Claude Security Investigator (TypeScript) v1.0
+**Agent:** Claude Security Investigator (TypeScript) v1.1
 **Files analyzed:** {count}
 
 ## Executive Summary
@@ -227,7 +341,13 @@ WORKFLOW (follow in order):
 {code snippet}
 \`\`\`
 **Exploitability:** ...
-**Remediation:** ...
+**Remediation:** {short one-liner from the auditor}
+
+**Suggested Fix:** {summary from the remediation subagent}
+\`\`\`
+{patch / diff / config change from the remediation subagent}
+\`\`\`
+{If confidence is "low" or notes are non-empty, surface them here as a one-line caveat.}
 
 ## High Findings
 {same structure, [HIGH] prefix}
@@ -251,12 +371,150 @@ WORKFLOW (follow in order):
 {Prioritized next steps. Numbered list.}
 \`\`\`
 
-5. SAVE THE REPORT. Use the Write tool to save the markdown to
+7. SAVE THE REPORT. Use the Write tool to save the markdown to
    \`${reportPath}\` (in the agent's working directory, not the target repo).
    Then print the markdown to stdout so the user sees it in the terminal.
 
 Be specific. Cite real file paths and line numbers. Quote the actual code.
 A security engineer should be able to act on this report in an afternoon.`;
+
+// ----------------------------------------------------------------------------
+// MCP server — in-process tools the deps-and-config subagent calls to look
+// up CVEs in GitHub's public advisory database. No subprocess, no Docker, no
+// auth required (the /advisories endpoint is public). If GITHUB_TOKEN is set
+// in the env we'll use it for a higher rate limit, but it's not required.
+// ----------------------------------------------------------------------------
+
+const GITHUB_API_BASE = "https://api.github.com";
+
+async function callGitHubAdvisoryAPI(
+  path: string,
+): Promise<{ status: number; body: unknown }> {
+  const url = `${GITHUB_API_BASE}/${path.replace(/^\//, "")}`;
+  const headers: Record<string, string> = {
+    Accept: "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28",
+    "User-Agent": "claude-security-investigator-ts/1.1",
+  };
+  if (process.env.GITHUB_TOKEN) {
+    headers.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
+  }
+  const res = await fetch(url, { headers });
+  const text = await res.text();
+  let body: unknown = text;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    /* leave as raw text */
+  }
+  return { status: res.status, body };
+}
+
+function asToolResult(payload: unknown) {
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text:
+          typeof payload === "string"
+            ? payload
+            : JSON.stringify(payload, null, 2),
+      },
+    ],
+  };
+}
+
+const githubMcpServer = createSdkMcpServer({
+  name: "github",
+  version: "1.0.0",
+  tools: [
+    tool(
+      "list_global_security_advisories",
+      "Search GitHub's global security advisory database for confirmed CVEs " +
+        "affecting a specific package. Returns a list of advisories with " +
+        "GHSA ID, CVE ID, summary, severity, and affected/patched version " +
+        "ranges. Call this first to enumerate advisories for a package, " +
+        "then use get_global_security_advisory for the full record on a " +
+        "specific match.",
+      {
+        ecosystem: z
+          .enum([
+            "pip",
+            "npm",
+            "maven",
+            "rubygems",
+            "nuget",
+            "go",
+            "rust",
+            "composer",
+            "actions",
+            "pub",
+            "swift",
+            "erlang",
+            "other",
+          ])
+          .describe("Package ecosystem the dependency belongs to."),
+          package: z
+          .string()
+          .describe("Package name as it appears in the manifest, e.g. 'flask'."),
+        severity: z
+          .enum(["unknown", "low", "medium", "high", "critical"])
+          .optional()
+          .describe("Optional CVSS severity filter."),
+        per_page: z
+          .number()
+          .int()
+          .min(1)
+          .max(100)
+          .optional()
+          .describe("Max results (default 30, max 100)."),
+      },
+      async ({ ecosystem, package: pkg, severity, per_page }) => {
+        const params = new URLSearchParams({ ecosystem, affects: pkg });
+        if (severity) params.set("severity", severity);
+        if (per_page) params.set("per_page", String(per_page));
+        const { status, body } = await callGitHubAdvisoryAPI(
+          `advisories?${params.toString()}`,
+        );
+        if (status !== 200) {
+          return asToolResult(
+            `GitHub API ${status}: ${
+              typeof body === "string" ? body : JSON.stringify(body)
+            }`,
+          );
+        }
+        return asToolResult(body);
+      },
+    ),
+    tool(
+      "get_global_security_advisory",
+      "Fetch the complete record for a single GitHub security advisory by " +
+        "its GHSA ID. Returns CVE ID, CVSS score and vector, full " +
+        "description, vulnerable version ranges, first patched versions, " +
+        "references, and source repository. Call this after " +
+        "list_global_security_advisories on a candidate match.",
+      {
+        ghsa_id: z
+          .string()
+          .regex(/^GHSA-[\w-]+$/i)
+          .describe("GitHub Security Advisory ID, e.g. 'GHSA-68rp-wp8r-4726'."),
+      },
+      async ({ ghsa_id }) => {
+        const { status, body } = await callGitHubAdvisoryAPI(
+          `advisories/${ghsa_id}`,
+        );
+        if (status !== 200) {
+          return asToolResult(
+            `GitHub API ${status}: ${
+              typeof body === "string" ? body : JSON.stringify(body)
+            }`,
+          );
+        }
+        return asToolResult(body);
+      },
+    ),
+  ],
+});
 
 // ----------------------------------------------------------------------------
 // Hooks — safety guardrail + audit trail.
@@ -509,22 +767,59 @@ async function runInvestigation(targetArg: string): Promise<number> {
 
   const auditLog: AuditEntry[] = [];
 
+  // Optional scope override. When INVESTIGATION_SCOPE is set (newline-separated
+  // relative paths), the orchestrator runs a partial audit focused on those
+  // files plus their immediate dependencies. Used by the webhook server to
+  // run cheap per-PR audits over only the changed files.
+  const scopeRaw = process.env.INVESTIGATION_SCOPE?.trim();
+  const scopePaths = scopeRaw
+    ? scopeRaw.split(/\r?\n/).map((p) => p.trim()).filter(Boolean)
+    : [];
+  const scopeBlock =
+    scopePaths.length > 0
+      ? `\nSCOPE OVERRIDE — partial PR audit, NOT a full-repo investigation.\n` +
+        `Focus your analysis on these changed files (relative to the target):\n` +
+        scopePaths.map((p) => `  - ${p}`).join("\n") +
+        `\n\nRead these files and any code paths they import or that import\n` +
+        `them. Do not audit unrelated parts of the repo. The remediation phase\n` +
+        `still applies to the findings produced from this scope.\n`
+      : "";
+
   const today = new Date().toISOString().slice(0, 10);
   const userPrompt =
     `Investigate the codebase at: ${target}\n\n` +
     `Today's date is ${today}.\n\n` +
-    `Follow your workflow: reconnaissance, parallel subagent delegation, ` +
-    `synthesis with extended thinking, then write the final report to ` +
-    `\`${resolvePath(REPORT_PATH)}\` and print it to stdout.`;
+    `Follow your workflow: reconnaissance, parallel audit-subagent ` +
+    `delegation (code-analysis + deps-and-config), then remediation ` +
+    `subagent on the merged findings, then synthesis with extended ` +
+    `thinking. Write the final report to ` +
+    `\`${resolvePath(REPORT_PATH)}\` and print it to stdout.` +
+    scopeBlock;
 
   const options: Options = {
     model: ORCHESTRATOR_MODEL,
     systemPrompt: ORCHESTRATOR_PROMPT(REPORT_PATH),
     agents: SUBAGENTS,
-    allowedTools: ["Read", "Grep", "Glob", "Bash", "Task", "Write"],
+    mcpServers: {
+      github: githubMcpServer,
+    },
+    allowedTools: [
+      "Read",
+      "Grep",
+      "Glob",
+      "Bash",
+      "Task",
+      "Write",
+      "mcp__github__list_global_security_advisories",
+      "mcp__github__get_global_security_advisory",
+    ],
     permissionMode: "bypassPermissions",
     allowDangerouslySkipPermissions: true,
     persistSession: false,
+    // Load project-level settings so the SDK discovers skills under
+    // `.claude/skills/` (the `code-analysis` subagent declares it via
+    // `skills: ['flask-vulnerabilities']`).
+    settingSources: ["project"],
     additionalDirectories: [target],
     maxThinkingTokens: 10000,
     hooks: {
@@ -544,7 +839,7 @@ async function runInvestigation(targetArg: string): Promise<number> {
         },
       ],
     },
-    maxTurns: 60,
+    maxTurns: 80,
     stderr: (data: string) => process.stderr.write(`[cli] ${data}`),
   };
 

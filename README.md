@@ -14,9 +14,9 @@ Four additions on top of v1 — three leveraging Agent SDK primitives directly, 
 
 | | Primitive (SDK API) | What it adds | Where |
 |---|---|---|---|
-| **1** | `AgentDefinition` + `agents` field on `Options` | Third subagent — `remediation` — drafts a diff-style patch for every finding the two auditor subagents produce | [`upgraded/agent.ts`](upgraded/agent.ts) — `remediation` block |
-| **2** | `createSdkMcpServer` + `tool` | In-process MCP server giving the deps-and-config subagent GitHub Advisory lookups — real CVE/GHSA IDs, CVSS, and fixed-version data lands in findings | [`upgraded/agent.ts`](upgraded/agent.ts) — `githubMcpServer` |
-| **3** | `AgentDefinition.skills` + `settingSources: ["project"]` | Six Flask-specific vulnerability patterns auto-loaded into the `code-analysis` subagent's context. Skill bundle (with `name` + `description` frontmatter) lives at the standard discovery path; the SDK handles loading | [`.claude/skills/flask-vulnerabilities/SKILL.md`](.claude/skills/flask-vulnerabilities/SKILL.md); `skills: ["flask-vulnerabilities"]` declaration in [`upgraded/agent.ts`](upgraded/agent.ts) |
+| **1** | `AgentDefinition` + `agents` field on `Options` | Third subagent — `remediation` — drafts a diff-style patch for every finding the two auditor subagents produce | [`agent.ts`](agent.ts) — `remediation` block |
+| **2** | `createSdkMcpServer` + `tool` | In-process MCP server giving the deps-and-config subagent GitHub Advisory lookups — real CVE/GHSA IDs, CVSS, and fixed-version data lands in findings | [`agent.ts`](agent.ts) — `githubMcpServer` |
+| **3** | `AgentDefinition.skills` + `settingSources: ["project"]` | Six Flask-specific vulnerability patterns auto-loaded into the `code-analysis` subagent's context. Skill bundle (with `name` + `description` frontmatter) lives at the standard discovery path; the SDK handles loading | [`.claude/skills/flask-vulnerabilities/SKILL.md`](.claude/skills/flask-vulnerabilities/SKILL.md); `skills: ["flask-vulnerabilities"]` declaration in [`agent.ts`](agent.ts) |
 
 ### Integration pattern built on top
 
@@ -26,7 +26,7 @@ Four additions on top of v1 — three leveraging Agent SDK primitives directly, 
 
 **How they compose at runtime:** the orchestrator runs recon, then kicks off `code-analysis` (skill auto-loaded by the SDK into its context) and `deps-and-config` (MCP server attached) in parallel, merges their findings, hands the merged list to `remediation` for fixes, and synthesizes with extended thinking. The chain reasoning crosses sources — a skill-flagged hardcoded `SECRET_KEY` plus an MCP-confirmed Werkzeug CVE end up in the same vulnerability chain even though they came from separate subagents.
 
-The CLI (`upgraded/agent.ts <repo>`) is for ad-hoc audits. The webhook server (`webhook-server/server.ts`) wraps the same agent for GitHub PR review — webhook in, scoped audit, comment out.
+The CLI (`agent.ts <repo>`) is for ad-hoc audits. The webhook server (`webhook-server/server.ts`) wraps the same agent for GitHub PR review — webhook in, scoped audit, comment out.
 
 ## Quick Start
 
@@ -37,7 +37,7 @@ npm install
 cp .env.example .env   # add ANTHROPIC_API_KEY (required for both modes)
 
 # CLI mode — one-off audit of a local directory
-npx tsx upgraded/agent.ts test-app/
+npx tsx agent.ts test-app/
 ```
 
 The report writes to `security-report.md`. The audit trail writes to `investigation-log.json`.

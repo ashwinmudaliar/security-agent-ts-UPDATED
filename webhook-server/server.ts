@@ -1,6 +1,6 @@
 /**
  * GitHub PR-review webhook server. Wraps the upgraded security investigator
- * (../upgraded/agent.ts) and runs it against the changed files of every PR
+ * (../agent.ts) and runs it against the changed files of every PR
  * that GitHub posts to /webhook.
  *
  * Flow per PR:
@@ -11,7 +11,7 @@
  *      minutes), then process in the background.
  *   5. List changed files via the GitHub API.
  *   6. Clone the base repo and check out `pull/<N>/head` (works for fork PRs).
- *   7. Spawn `npx tsx upgraded/agent.ts <repo>` with INVESTIGATION_SCOPE set
+ *   7. Spawn `npx tsx agent.ts <repo>` with INVESTIGATION_SCOPE set
  *      to the changed-file list — the agent runs a focused audit.
  *   8. Read security-report.md, post it as a PR comment via the issues API.
  *   9. Clean up the temp work dir.
@@ -50,7 +50,7 @@ const ANTHROPIC_API_KEY = requireEnv("ANTHROPIC_API_KEY");
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolvePath(SERVER_DIR, "..");
-const AGENT_PATH = joinPath(REPO_ROOT, "upgraded", "agent.ts");
+const AGENT_PATH = joinPath(REPO_ROOT, "agent.ts");
 
 const AGENT_TIMEOUT_MS = 15 * 60 * 1000; // 15 min hard cap per PR
 const COMMENT_BODY_LIMIT = 60_000; // GitHub's hard limit is 65,536

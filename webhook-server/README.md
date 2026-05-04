@@ -9,7 +9,7 @@ the report as a PR comment.
 GitHub PR ──webhook──▶  POST /webhook  ──▶  verify HMAC
                                        ──▶  list changed files (GitHub API)
                                        ──▶  clone + checkout PR head
-                                       ──▶  run upgraded/agent.ts (scoped)
+                                       ──▶  run agent.ts (scoped)
                                        ──▶  POST /repos/.../issues/N/comments
 ```
 
@@ -162,7 +162,7 @@ files.
 - **Fork PRs.** Handled. The server fetches the `pull/<N>/head` ref from the
   base repo (GitHub mirrors fork PR branches there), so we don't need to
   authenticate against the fork's clone URL.
-- **`INVESTIGATION_SCOPE`.** New env var added to `upgraded/agent.ts`. When
+- **`INVESTIGATION_SCOPE`.** New env var added to `agent.ts`. When
   set (newline-separated relative paths), the orchestrator prepends a SCOPE
   OVERRIDE block to its user prompt and audits only the listed files plus
   their direct callers/dependencies. Unset → original whole-repo behavior.
