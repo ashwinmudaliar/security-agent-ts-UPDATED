@@ -719,33 +719,47 @@ function makePostToolHook(auditLog: AuditEntry[]): HookCallback {
 // Runner.
 // ----------------------------------------------------------------------------
 
-/** Surface a short progress line for an assistant message, if interesting. */
-function formatProgress(message: unknown): string | null {
-  const m = message as {
-    type?: string;
-    message?: { content?: Array<{ type?: string; name?: string; input?: Record<string, unknown> }> };
-  };
-  if (m.type !== "assistant" || !m.message?.content) return null;
-  for (const block of m.message.content) {
-    if (block.type === "tool_use") {
-      const name = block.name ?? "";
-      const inp = (block.input ?? {}) as Record<string, unknown>;
-      if (name === "Task") {
-        return `  → delegating to ${inp.subagent_type ?? "?"} subagent`;
-      }
-      if (name === "Read") return `  · read ${inp.file_path ?? ""}`;
-      if (name === "Glob") return `  · glob ${inp.pattern ?? ""}`;
-      if (name === "Grep") return `  · grep ${JSON.stringify(inp.pattern ?? "")}`;
-      if (name === "Bash") {
-        const cmd = String(inp.command ?? "");
-        return `  · bash ${cmd.slice(0, 80)}`;
-      }
-      if (name === "Write") return `  · write ${inp.file_path ?? ""}`;
-      return `  · ${name}`;
-    }
-    if (block.type === "thinking") return "  … thinking";
+// ----------------------------------------------------------------------------
+// Progress streamer — tag every line with the subagent that emitted it.
+// ----------------------------------------------------------------------------
+//
+// Every message streamed by query() carries `parent_tool_use_id`. When the
+// orchestrator delegates via a Task/Agent tool call, we record that tool's
+// `id` against its `subagent_type`. Subsequent messages from the subagent
+// arrive with `parent_tool_use_id` matching that id — which lets us tag every
+// downstream tool_use / thinking line with the right subagent.
+
+const SUBAGENT_LABEL: Record<string, string> = {
+  orchestrator: "orch",
+  "code-analysis": "code",
+  "deps-and-config": "deps",
+  remediation: "remed",
+};
+
+const SUBAGENT_COLOR: Record<string, string> = {
+  orchestrator: "\x1b[36m", // cyan
+  "code-analysis": "\x1b[34m", // blue
+  "deps-and-config": "\x1b[35m", // magenta
+  remediation: "\x1b[32m", // green
+};
+const COLOR_RESET = "\x1b[0m";
+
+function tagFor(subagent: string): string {
+  const label = (SUBAGENT_LABEL[subagent] ?? "??").padEnd(5);
+  const color = SUBAGENT_COLOR[subagent] ?? SUBAGENT_COLOR.orchestrator!;
+  return `${color}[${label}]${COLOR_RESET}`;
+}
+
+function formatToolUse(name: string, inp: Record<string, unknown>): string {
+  if (name === "Read") return `· read ${inp.file_path ?? ""}`;
+  if (name === "Glob") return `· glob ${inp.pattern ?? ""}`;
+  if (name === "Grep") return `· grep ${JSON.stringify(inp.pattern ?? "")}`;
+  if (name === "Bash") {
+    const cmd = String(inp.command ?? "");
+    return `· bash ${cmd.slice(0, 70)}`;
   }
-  return null;
+  if (name === "Write") return `· write ${inp.file_path ?? ""}`;
+  return `· ${name}`;
 }
 
 async function pathExists(p: string): Promise<boolean> {
@@ -853,24 +867,65 @@ async function runInvestigation(targetArg: string): Promise<number> {
   let totalCost: number | null = null;
 
   let sawResult = false;
+  // Maps a Task/Agent tool_use id → the subagent_type it delegated to. Filled
+  // when we observe the orchestrator's delegation; consumed when downstream
+  // messages from that subagent arrive carrying parent_tool_use_id.
+  const subagentByToolUseId = new Map<string, string>();
+
   try {
     for await (const msg of query({ prompt: userPrompt, options })) {
-      const line = formatProgress(msg);
-      if (line) process.stdout.write(line + "\n");
+      const m = msg as {
+        type?: string;
+        parent_tool_use_id?: string | null;
+        message?: {
+          content?: Array<{
+            type?: string;
+            name?: string;
+            id?: string;
+            text?: string;
+            input?: Record<string, unknown>;
+          }>;
+        };
+      };
 
-      if (msg.type === "assistant" && msg.message?.content) {
-        for (const block of msg.message.content as Array<{
-          type?: string;
-          text?: string;
-        }>) {
-          if (block.type === "text" && typeof block.text === "string") {
-            finalTextParts.push(block.text);
-          }
-        }
-      }
-      if (msg.type === "result") {
+      if (m.type === "result") {
         sawResult = true;
         totalCost = (msg as { total_cost_usd?: number }).total_cost_usd ?? null;
+        continue;
+      }
+
+      if (m.type !== "assistant" || !m.message?.content) continue;
+
+      const subagent = m.parent_tool_use_id
+        ? subagentByToolUseId.get(m.parent_tool_use_id) ?? "orchestrator"
+        : "orchestrator";
+      const tag = tagFor(subagent);
+
+      for (const block of m.message.content) {
+        if (block.type === "text" && typeof block.text === "string") {
+          finalTextParts.push(block.text);
+          continue;
+        }
+        if (block.type === "thinking") {
+          process.stdout.write(`${tag} … thinking\n`);
+          continue;
+        }
+        if (block.type === "tool_use") {
+          const name = block.name ?? "";
+          const inp = (block.input ?? {}) as Record<string, unknown>;
+          const id = block.id ?? "";
+
+          // Record subagent delegation so later messages are attributed.
+          if ((name === "Task" || name === "Agent") && inp.subagent_type && id) {
+            subagentByToolUseId.set(id, String(inp.subagent_type));
+            process.stdout.write(
+              `${tag} → delegating to ${inp.subagent_type}\n`,
+            );
+            continue;
+          }
+
+          process.stdout.write(`${tag} ${formatToolUse(name, inp)}\n`);
+        }
       }
     }
   } catch (err) {
