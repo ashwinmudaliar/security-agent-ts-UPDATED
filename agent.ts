@@ -30,6 +30,8 @@ import {
   type Options,
   type PreToolUseHookInput,
   type PostToolUseHookInput,
+  type SubagentStartHookInput,
+  type SubagentStopHookInput,
   type HookCallback,
   type HookJSONOutput,
 } from "@anthropic-ai/claude-agent-sdk";
@@ -715,6 +717,62 @@ function makePostToolHook(auditLog: AuditEntry[]): HookCallback {
   };
 }
 
+/**
+ * Subagent lifecycle hooks. Logs a session-start banner per subagent showing
+ * what's preloaded (tools + skills), and a return-with-elapsed-time line when
+ * the subagent exits. Without these, subagent boundaries are inferred only
+ * from the orchestrator's "→ delegating" lines and the silent text-block
+ * return path.
+ */
+function makeSubagentLifecycleHooks(): {
+  onStart: HookCallback;
+  onStop: HookCallback;
+} {
+  // agent_id → session-start timestamp, for elapsed-time on stop.
+  const startTimes = new Map<string, number>();
+
+  return {
+    onStart: async (input): Promise<HookJSONOutput> => {
+      const h = input as SubagentStartHookInput;
+      const agentType = h.agent_type;
+      if (!agentType) return {};
+      const def = SUBAGENTS[agentType];
+      if (!def) return {};
+
+      startTimes.set(h.agent_id, Date.now());
+
+      const tag = tagFor(agentType);
+      const tools = def.tools ?? [];
+      const mcpTools = tools.filter((t) => t.startsWith("mcp__"));
+      const localTools = tools.filter((t) => !t.startsWith("mcp__"));
+      const skills = (def as { skills?: string[] }).skills ?? [];
+
+      const parts: string[] = [`tools=${localTools.join(",")}`];
+      if (mcpTools.length > 0) parts.push(`+${mcpTools.length} MCP`);
+      if (skills.length > 0) parts.push(`skills=${skills.join(",")}`);
+
+      process.stdout.write(`${tag} ★ session start  ${parts.join("  ")}\n`);
+      return {};
+    },
+    onStop: async (input): Promise<HookJSONOutput> => {
+      const h = input as SubagentStopHookInput;
+      const agentType = h.agent_type;
+      if (!agentType) return {};
+
+      const tag = tagFor(agentType);
+      const startedAt = startTimes.get(h.agent_id);
+      const elapsed =
+        startedAt !== undefined
+          ? `${((Date.now() - startedAt) / 1000).toFixed(1)}s`
+          : "?";
+      startTimes.delete(h.agent_id);
+
+      process.stdout.write(`${tag} ↩ returned in ${elapsed}\n`);
+      return {};
+    },
+  };
+}
+
 // ----------------------------------------------------------------------------
 // Runner.
 // ----------------------------------------------------------------------------
@@ -745,12 +803,31 @@ const SUBAGENT_COLOR: Record<string, string> = {
 const COLOR_RESET = "\x1b[0m";
 
 function tagFor(subagent: string): string {
-  const label = (SUBAGENT_LABEL[subagent] ?? "??").padEnd(5);
+  // Known subagents get short labels; unknown ones (e.g. SDK-internal agent
+  // types) fall back to a 5-char truncation of their name rather than "??".
+  const label = (SUBAGENT_LABEL[subagent] ?? subagent.slice(0, 5)).padEnd(5);
   const color = SUBAGENT_COLOR[subagent] ?? SUBAGENT_COLOR.orchestrator!;
   return `${color}[${label}]${COLOR_RESET}`;
 }
 
 function formatToolUse(name: string, inp: Record<string, unknown>): string {
+  // MCP tool calls — distinct visual marker so they pop out of the local-tool noise.
+  // Tool names are exposed by the SDK as `mcp__<server>__<tool>`.
+  if (name.startsWith("mcp__")) {
+    const parts = name.split("__");
+    if (parts.length >= 3) {
+      const server = parts[1];
+      const toolName = parts.slice(2).join("__");
+      // Surface a key arg inline so each MCP call line is meaningful.
+      let arg = "";
+      if (inp.ecosystem && inp.package) {
+        arg = `  ecosystem=${inp.ecosystem} package=${inp.package}`;
+      } else if (inp.ghsa_id) {
+        arg = `  ${inp.ghsa_id}`;
+      }
+      return `⚡ mcp:${server}  ${toolName}${arg}`;
+    }
+  }
   if (name === "Read") return `· read ${inp.file_path ?? ""}`;
   if (name === "Glob") return `· glob ${inp.pattern ?? ""}`;
   if (name === "Grep") return `· grep ${JSON.stringify(inp.pattern ?? "")}`;
@@ -780,6 +857,7 @@ async function runInvestigation(targetArg: string): Promise<number> {
   }
 
   const auditLog: AuditEntry[] = [];
+  const subagentLifecycle = makeSubagentLifecycleHooks();
 
   // Optional scope override. When INVESTIGATION_SCOPE is set (newline-separated
   // relative paths), the orchestrator runs a partial audit focused on those
@@ -852,6 +930,12 @@ async function runInvestigation(targetArg: string): Promise<number> {
           hooks: [makePostToolHook(auditLog)],
         },
       ],
+      SubagentStart: [
+        { matcher: ".*", hooks: [subagentLifecycle.onStart] },
+      ],
+      SubagentStop: [
+        { matcher: ".*", hooks: [subagentLifecycle.onStop] },
+      ],
     },
     maxTurns: 80,
     stderr: (data: string) => process.stderr.write(`[cli] ${data}`),
@@ -859,7 +943,27 @@ async function runInvestigation(targetArg: string): Promise<number> {
 
   process.stdout.write(`▸ Investigating ${target}\n`);
   process.stdout.write(
-    `▸ Orchestrator: ${ORCHESTRATOR_MODEL}  |  Subagents: ${SUBAGENT_MODEL}\n\n`,
+    `▸ Orchestrator: ${ORCHESTRATOR_MODEL}  |  Subagents: ${SUBAGENT_MODEL}\n`,
+  );
+
+  // Active-enhancements banner. Surfaces the v2-only capabilities up front so
+  // a viewer of the live stream knows what's wired up before any tool calls
+  // fire. Each row maps to one row in the README's "What's New" table.
+  process.stdout.write(`▸ Active enhancements (vs v1):\n`);
+  process.stdout.write(
+    `    ✓ Subagents:    ${Object.keys(SUBAGENTS).join(" · ")}\n`,
+  );
+  process.stdout.write(
+    `    ✓ MCP server:   github (CVE/GHSA advisory lookups · 2 in-process tools)\n`,
+  );
+  // Dynamically enumerate which subagents have skills loaded.
+  const skillsLines: string[] = [];
+  for (const [name, def] of Object.entries(SUBAGENTS)) {
+    const skills = (def as { skills?: string[] }).skills ?? [];
+    if (skills.length > 0) skillsLines.push(`${skills.join(",")} (→ ${name})`);
+  }
+  process.stdout.write(
+    `    ✓ Skills:       ${skillsLines.join(", ") || "(none)"}\n\n`,
   );
 
   const started = performance.now();
